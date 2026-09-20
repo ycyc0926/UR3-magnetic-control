@@ -1,0 +1,26 @@
+camera_node:
+  ros__parameters:
+    mode: gstreamer
+    width: 1224
+    height: 1024
+    fps: 20.0
+    frame_id: camera_optical_frame
+    gstreamer_pipeline: >-
+      aravissrc camera-name=FLIR-1E100152397C-0152397C
+      features="TriggerMode=Off Width=2448 Height=2048 PixelFormat=BayerRG8"
+      ! video/x-bayer,format=rggb,width=2448,height=2048
+      ! bayer2rgb
+      ! videoconvert
+      ! videoscale
+      ! video/x-raw,format=BGR,width=1224,height=1024
+      ! appsink drop=true max-buffers=1 sync=false
+
+target_tracker:
+  ros__parameters:
+    minimum_area_px: 500.0
+
+safety_supervisor:
+  ros__parameters:
+    target_timeout_s: 0.2
+    robot_state_timeout_s: 0.2
+    require_robot_state: false

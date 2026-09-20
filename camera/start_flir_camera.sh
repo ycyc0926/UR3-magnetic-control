@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+camera_id="1e10:4000"
+
+if ! lsusb -d "${camera_id}" >/dev/null 2>&1; then
+  zenity --error --title="FLIR 相机" \
+    --text="没有检测到 Blackfly S 相机。请确认相机连接在 USB 3.x 接口。" 2>/dev/null || \
+    echo "没有检测到 Blackfly S 相机。请确认 USB 连接。" >&2
+  exit 1
+fi
+
+if pgrep -x SpinView_QT >/dev/null 2>&1; then
+  zenity --warning --title="FLIR 相机" \
+    --text="SpinView 正在占用相机。请先关闭 SpinView，再启动全分辨率查看器。" 2>/dev/null || \
+    echo "SpinView 正在占用相机，请先关闭它。" >&2
+  exit 1
+fi
+
+# Restore the camera's full sensor area and free-running acquisition. These
+# settings are volatile; no firmware or saved UserSet is modified.
+arv-tool-0.8 control \
+  TriggerMode=Off \
+  Width=8 Height=6 \
+  OffsetX=0 OffsetY=0 \
+  Width=2448 Height=2048 \
+  PixelFormat=BayerRG8 >/dev/null
+
+exec arv-viewer-0.8 --usb-mode=async

@@ -1,0 +1,60 @@
+network:
+  robot_ip: 192.168.56.101
+  control_pc_ip: 192.168.56.1
+  external_control_port: 50002
+
+robot:
+  type: ur3
+  calibration_file: /home/yc/UR3/config/ur3_calibration.yaml
+  # Sphere-centre TCP measured from the flange/tool0 frame.
+  magnet_tcp_xyz_m: [0.0, -0.062, 0.041]
+  magnet_tcp_rpy_rad: [0.0, 0.0, 0.0]
+  magnet_sphere_radius_m: 0.010
+  payload_mass_kg: 0.32
+  # The shaft points from the motor toward the sphere along tool0 -Y.
+  motor_axis_tool_vector: [0.0, -1.0, 0.0]
+  # Physically confirmed by the user on 2026-09-19.
+  motor_axis_verified: true
+
+camera:
+  serial: "22165884"
+  width: 2448
+  height: 2048
+  target_fps: 30.0
+  frame_id: camera_optical_frame
+
+safety:
+  target_timeout_s: 0.2
+  robot_state_timeout_s: 0.2
+  initial_max_tcp_speed_m_s: 0.02
+  initial_max_motor_rpm: 0.0
+  # One global policy for nominal paths, stopping models and live checks.
+  # Motion-specific code must not override the acrylic-bottom or side values.
+  clearance_policy_m:
+    acrylic_bottom: 0.005
+    side: 0.010
+    table: 0.010
+  workspace_bounds_m:
+    x: [-0.45, 0.45]
+    y: [-0.75, -0.20]
+    z: [0.05, 0.60]
+
+# 相机与磁铁支架固定后再测量这些参数。
+calibration:
+  camera_matrix:
+    - [3625.088677168018, 0.0, 1200.123248394464]
+    - [0.0, 3630.425985277284, 1067.173693198475]
+    - [0.0, 0.0, 1.0]
+  distortion_coefficients: [-0.274982454144, 1.568575307653, 0.0, 0.0, 0.0]
+  # Maps undistorted image pixels to world X/Y on acrylic world z=0.498141 m.
+  image_to_workspace_homography:
+    - [0.000103078658415, 0.000001546589360, 0.064584177671]
+    - [0.000001644476475, -0.000102647465603, 0.269099451973]
+    - [0.000001105524938, 0.000000431915695, 1.0]
+  workspace_to_base_transform:
+    - [-0.999972620, 0.007397899, -0.000175681, 0.276097000]
+    - [-0.007397883, -0.999972631, -0.000088533, -0.248236000]
+    - [-0.000176331, -0.000087231, 0.999999981, -0.016152000]
+    - [0.0, 0.0, 0.0, 1.0]
+  camera_robot_file: /home/yc/UR3/config/camera_robot_calibration.yaml
+  motor_phase_zero_rad: null

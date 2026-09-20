@@ -1,0 +1,44 @@
+# Table-world calibration measured with the 100 mm probe TCP.
+# Positions are expressed in the UR base frame, in metres.
+robot_ip: 192.168.56.101
+probe_tcp_xyz_m: [0.0, 0.0, 0.100]
+
+points_base_m:
+  w0: [0.276097, -0.248236, -0.016152]
+  wx: [0.151335, -0.249159, -0.016174]
+  wy: [0.276765, -0.373809, -0.016163]
+
+quality:
+  w0_to_wx_m: 0.124765416
+  w0_to_wy_m: 0.125574777
+  measured_xy_angle_deg: 89.880916
+
+# Unit vectors of the table-world axes, expressed in the UR base frame.
+world_axes_in_base:
+  x: [-0.999972620, -0.007397883, -0.000176331]
+  y: [0.007397899, -0.999972631, -0.000087231]
+  z: [-0.000175681, -0.000088533, 0.999999981]
+
+# Homogeneous transform p_base = T_base_from_world * p_world.
+T_base_from_world:
+  - [-0.999972620, 0.007397899, -0.000175681, 0.276097000]
+  - [-0.007397883, -0.999972631, -0.000088533, -0.248236000]
+  - [-0.000176331, -0.000087231, 0.999999981, -0.016152000]
+  - [0.0, 0.0, 0.0, 1.0]
+
+# Inverse transform p_world = T_world_from_base * p_base.
+T_world_from_base:
+  - [-0.999972620, -0.007397883, -0.000176331, 0.274250171]
+  - [0.007397899, -0.999972631, -0.000087231, -0.250273153]
+  - [-0.000175681, -0.000088533, 0.999999981, 0.016178528]
+  - [0.0, 0.0, 0.0, 1.0]
+
+fixed_work_surface:
+  # One-point height measurement; assumes the fixed acrylic is parallel to
+  # the calibrated perforated-table world plane.
+  probe_contact_base_m: [0.212398, -0.424034, 0.474562]
+  probe_contact_world_m: [0.064912, 0.175279, 0.490741]
+  acrylic_bottom_world_z_m: 0.490741
+  acrylic_thickness_m: 0.007400
+  acrylic_top_world_z_m: 0.498141
+  paper_thickness_m: null

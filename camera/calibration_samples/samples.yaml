@@ -1,0 +1,171 @@
+camera:
+  serial: "22165884"
+  image_size_px: [2448, 2048]
+
+marker:
+  dictionary: DICT_ARUCO_ORIGINAL
+  id: 450
+  outer_edge_m: 0.100
+
+robot:
+  ip: 192.168.56.101
+  active_tcp_xyz_m: [0.0, 0.0, 0.060]
+
+samples:
+  - name: sample_000
+    image: sample_000.png
+    stationary: true
+    tcp_pose_base_m_rad: [0.086111, -0.406964, 0.415346, 0.142845, 0.056510, -3.134768]
+    marker_corners_px:
+      - [808.0, 1519.0]
+      - [809.0, 686.0]
+      - [1624.0, 695.0]
+      - [1629.0, 1509.0]
+    marker_area_px2: 673624.0
+  - name: sample_001
+    image: sample_001.png
+    stationary: true
+    motion_from_previous: {base_axis: -x, distance_m: 0.005}
+    tcp_pose_base_m_rad: [0.081101, -0.406938, 0.415363, 0.142745, 0.056454, -3.134822]
+    marker_corners_px:
+      - [851.0, 1520.0]
+      - [851.0, 687.0]
+      - [1665.0, 696.0]
+      - [1670.0, 1509.0]
+    marker_area_px2: 671982.0
+  - name: sample_002
+    image: sample_002.png
+    stationary: true
+    motion_from_previous: {base_roll_deg: 5.0}
+    tcp_pose_base_m_rad: [0.080995, -0.412204, 0.414966, -0.143340, -0.193285, 3.130734]
+    marker_corners_px:
+      - [848.0, 1472.0]
+      - [857.0, 646.0]
+      - [1662.0, 665.0]
+      - [1676.0, 1471.0]
+    marker_area_px2: 666241.5
+  - name: sample_003
+    image: sample_003.png
+    stationary: true
+    motion_from_previous: {base_roll_deg: -17.0}
+    tcp_pose_base_m_rad: [0.081291, -0.394319, 0.414451, 0.139917, -0.270439, -3.113009]
+    marker_corners_px:
+      - [858.0, 1614.0]
+      - [838.0, 803.0]
+      - [1672.0, 790.0]
+      - [1656.0, 1584.0]
+    marker_area_px2: 654883.0
+  - name: sample_004
+    image: sample_004.png
+    stationary: true
+    motion_from_previous: {base_roll_deg: 12.0, base_pitch_deg: 12.0}
+    tcp_pose_base_m_rad: [0.093581, -0.407015, 0.415115, 0.185822, -0.057447, 3.133801]
+    marker_corners_px:
+      - [752.0, 1506.0]
+      - [761.0, 693.0]
+      - [1575.0, 686.0]
+      - [1572.0, 1518.0]
+    marker_area_px2: 671997.5
+  - name: sample_005
+    image: sample_005.png
+    stationary: true
+    motion_from_previous: {base_pitch_deg: -20.0}
+    tcp_pose_base_m_rad: [0.072766, -0.406947, 0.414051, 0.360553, 0.055640, -3.114524]
+    marker_corners_px:
+      - [930.0, 1529.0]
+      - [926.0, 683.0]
+      - [1713.0, 704.0]
+      - [1720.0, 1502.0]
+    marker_area_px2: 648163.5
+  - name: sample_006
+    image: sample_006.png
+    stationary: true
+    motion_from_previous: {base_axis: -x, distance_m: 0.020}
+    tcp_pose_base_m_rad: [0.052734, -0.406955, 0.414032, 0.360383, 0.056163, -3.114617]
+    marker_corners_px:
+      - [1100.0, 1532.0]
+      - [1095.0, 686.0]
+      - [1871.0, 708.0]
+      - [1879.0, 1505.0]
+    marker_area_px2: 638732.5
+  - name: sample_007
+    image: sample_007.png
+    stationary: true
+    motion_from_previous: {base_axis: +y, distance_m: 0.020}
+    tcp_pose_base_m_rad: [0.052709, -0.386963, 0.414031, 0.360682, 0.055882, -3.114525]
+    marker_corners_px:
+      - [1095.0, 1700.0]
+      - [1089.0, 856.0]
+      - [1869.0, 868.0]
+      - [1874.0, 1665.0]
+    marker_area_px2: 639643.0
+  - name: sample_008
+    image: sample_008.png
+    stationary: true
+    motion_from_previous: {base_axis: +x, distance_m: 0.020}
+    tcp_pose_base_m_rad: [0.072716, -0.386957, 0.414031, 0.360797, 0.055407, -3.114572]
+    marker_corners_px:
+      - [926.0, 1698.0]
+      - [922.0, 851.0]
+      - [1711.0, 864.0]
+      - [1716.0, 1663.0]
+    marker_area_px2: 649808.0
+  - name: sample_009
+    image: sample_009.png
+    stationary: true
+    motion_from_previous: {base_axis: -y, distance_m: 0.020}
+    tcp_pose_base_m_rad: [0.072707, -0.406929, 0.414067, 0.360544, 0.055395, -3.114746]
+    marker_corners_px:
+      - [929.0, 1528.0]
+      - [926.0, 683.0]
+      - [1714.0, 705.0]
+      - [1721.0, 1503.0]
+    marker_area_px2: 648992.5
+  - name: sample_010
+    image: sample_010.png
+    stationary: true
+    marker_id_decoded: false
+    motion_from_previous: {base_axis: -y, distance_m: 0.020}
+    tcp_pose_base_m_rad: [0.072709, -0.426918, 0.414044, 0.360228, 0.055671, -3.114983]
+    marker_corners_px:
+      - [933.0, 1358.0]
+      - [930.0, 515.0]
+      - [1715.0, 545.0]
+      - [1724.0, 1342.0]
+    marker_area_px2: 646118.0
+  - name: sample_011
+    image: sample_011.png
+    stationary: true
+    marker_id_decoded: true
+    motion_from_previous: {base_roll_deg: 12.0, base_pitch_deg: 8.0}
+    tcp_pose_base_m_rad: [0.080463, -0.439210, 0.413633, -0.142130, -0.374444, 3.078036]
+    marker_corners_px:
+      - [841.0, 1218.0]
+      - [885.0, 427.0]
+      - [1673.0, 483.0]
+      - [1679.0, 1258.0]
+    marker_area_px2: 637491.0
+  - name: sample_012
+    image: sample_012.png
+    stationary: true
+    marker_id_decoded: true
+    motion_from_previous: {base_roll_deg: -20.0}
+    tcp_pose_base_m_rad: [0.080832, -0.418233, 0.414959, -0.148925, 0.166790, 3.114530]
+    marker_corners_px:
+      - [848.0, 1410.0]
+      - [862.0, 582.0]
+      - [1687.0, 606.0]
+      - [1653.0, 1415.0]
+    marker_area_px2: 667425.5
+  - name: sample_013
+    image: sample_013.png
+    stationary: true
+    marker_id_decoded: true
+    motion_from_previous: {base_yaw_deg: 15.0}
+    tcp_pose_base_m_rad: [0.079405, -0.420027, 0.414955, 0.157040, -0.134410, -2.892135]
+    marker_corners_px:
+      - [979.0, 1490.0]
+      - [778.0, 687.0]
+      - [1580.0, 496.0]
+      - [1758.0, 1284.0]
+    marker_area_px2: 666458.5

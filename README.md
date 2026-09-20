@@ -1,0 +1,72 @@
+# UR3 磁驱动机器人实验
+
+本目录包含 UR3、FLIR 相机和 H 型磁机器人的实验代码。代码、配置、实验数据和
+历史资料已经分开存放；真实机械臂运动前必须重新读取当前状态并生成新的审核结果，
+不得直接重放历史轨迹。
+
+## 目录结构
+
+| 目录 | 内容 |
+|---|---|
+| `config/` | 唯一的系统、标定、工具和场景配置 |
+| `ros2_ws/src/ur3_magnetic_control/` | 正式 ROS 2 Python 包、launch 文件和包内测试 |
+| `robot/` | UR3 专用规划、只读监控、受保护执行器和离线碰撞检查代码 |
+| `camera/` | 相机启动、标定脚本和 H 跟踪入口 |
+| `camera/tracking_sessions/` | 相机原始实验记录，不属于源代码 |
+| `robot/planning_checks/` | 机械臂规划和执行审计记录，不是可直接重放的命令 |
+| `docs/` | 环境说明、历史交接、照片和参考论文 |
+| `vendor/` | 固定版本的第三方 UR ROS 2 驱动源码 |
+
+ROS 的 `build/`、`install/`、`log/` 和 Python 缓存都是生成物。当前
+`ros2_ws/install/` 使用指向 `build/` 的符号链接，因此不要只删 `build/`；需要彻底
+重建时应同时清理三者再运行 `colcon build --symlink-install`。
+
+## 常用入口
+
+加载 ROS 2 Humble 和本工作区：
+
+```bash
+source /home/yc/UR3/ros2_env.sh
+```
+
+启动 H 机器人视觉跟踪（不控制机械臂或电机）：
+
+```bash
+bash /home/yc/UR3/camera/start_h_tracking.sh
+```
+
+运行全部离线测试：
+
+```bash
+source /home/yc/UR3/ros2_env.sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider \
+  /home/yc/UR3/ros2_ws/src/ur3_magnetic_control/test \
+  /home/yc/UR3/robot/tests
+```
+
+详细入口见 [机械臂说明](robot/README.md)、[相机说明](camera/README.md)和
+[ROS 2 环境说明](docs/setup/ROS2.md)。H 移动录像的快捷入口位于
+[`camera/motion_examples/`](camera/motion_examples/README.md)。
+
+## 当前安全配置
+
+全局净空策略只允许在
+`config/ur3_system.yaml:safety.clearance_policy_m` 中配置：
+
+- 亚克力板底净空：5 mm
+- 左、右侧净空：各 10 mm
+- 桌面净空：10 mm
+
+运动脚本不得分别覆盖板底或左右侧净空。历史报告中出现的其他阈值仅描述当时
+工况，不符合当前配置时不得复用。
+
+## 数据保留原则
+
+录像、CSV、RTDE 输出、规划报告和执行报告均保留为实验依据。确认无用前不要按
+文件大小删除它们。可安全清理的内容仅包括 `__pycache__`、`.pytest_cache`、ROS
+构建日志等可重新生成的缓存。
+
+GitHub 轻量版本只提交源码、配置、说明和小型图片；原始跟踪会话、规划审计数据、
+标定原图、论文 PDF、构建输出以及完整第三方驱动快照仅保留在实验电脑。为保证克隆
+后仍可构建，本项目实际修改过的 `ur_calibration` 小型源码包直接保存在
+`ros2_ws/src/ur_calibration/`。

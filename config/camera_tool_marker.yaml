@@ -1,0 +1,20 @@
+# Physical ArUco target currently mounted on the UR3 tool.
+# The printed target was decoded from a live FLIR frame on 2026-09-18.
+dictionary: DICT_ARUCO_ORIGINAL
+marker_id: 450
+marker_outer_edge_m: 0.100
+reported_marker_outer_edge_m: 0.100
+paper_size_m: [0.100, 0.100]
+marker_size_requires_ruler_verification: false
+
+mount:
+  flange_to_marker_plane_normal_distance_m: 0.060
+  flange_to_marker_center_xyz_m: [0.0, 0.0, 0.060]
+  marker_plane_parallel_to_flange: true
+  marker_front_normal_flange_axis: "+Z"
+  # In-plane yaw about flange +Z can be measured or solved during hand-eye calibration.
+  flange_to_marker_rpy_rad: [0.0, 0.0, null]
+
+source_note: >-
+  The physical target does not match camera/aruco-9.svg, whose intended ID is 9.
+  Detection must follow the physical target (ID 450) unless it is reprinted.

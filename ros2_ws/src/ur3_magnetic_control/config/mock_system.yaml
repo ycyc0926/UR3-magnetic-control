@@ -1,0 +1,24 @@
+camera_node:
+  ros__parameters:
+    mode: synthetic
+    width: 640
+    height: 480
+    fps: 30.0
+    frame_id: camera_optical_frame
+target_tracker:
+  ros__parameters:
+    minimum_area_px: 200.0
+path_publisher:
+  ros__parameters:
+    length_m: 0.10
+    point_count: 51
+    frame_id: workspace
+mock_motor:
+  ros__parameters:
+    allow_nonzero: false
+    max_rpm: 0.0
+safety_supervisor:
+  ros__parameters:
+    target_timeout_s: 0.2
+    robot_state_timeout_s: 0.2
+    require_robot_state: false

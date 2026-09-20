@@ -1,0 +1,16 @@
+# Offline diagnostic input only; not a live controller or safety configuration.
+execution_allowed: false
+frame: table_world
+source_image: /home/yc/UR3/docs/images/hardware/侧板.jpg
+user_confirmed:
+  photo_right: '+X'
+  photo_forward: '+Y'
+  distances_are_to_inner_faces: true
+left_inner_x_m: -0.140
+right_inner_x_m: 0.590
+# Conservatively require all modeled geometry to remain between these infinite
+# planes, including outside the finite panels' Y/Z extents. The single active
+# clearance policy is config/ur3_system.yaml:safety.clearance_policy_m; do not
+# put a separate side-clearance setting in this geometry file.
+model: infinite_parallel_yz_planes
+not_modeled: [aluminium_posts_inside_corridor, loose_objects, cables]

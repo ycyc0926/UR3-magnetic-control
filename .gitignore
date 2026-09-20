@@ -1,0 +1,37 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ROS 2 / colcon generated output
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Standalone CMake generated output
+robot/offline_collision/build/
+
+# Runtime logs
+camera/SpinView_QT_log
+
+# Editors and operating systems
+.idea/
+.vscode/
+*~
+.DS_Store
+
+# Large experiment data retained only on the lab computer. Keep the README
+# indexes in Git so clones still explain where the omitted data belong.
+camera/tracking_sessions/*
+!camera/tracking_sessions/README.md
+camera/motion_examples/*.avi
+camera/calibration_samples/*.png
+
+robot/planning_checks/*
+!robot/planning_checks/README.md
+
+# Reference PDFs and the full upstream driver snapshot are not needed to run
+# this repository. The locally patched ur_calibration package is committed
+# directly under ros2_ws/src/ur_calibration instead.
+docs/references/*.pdf
+vendor/Universal_Robots_ROS2_Driver-2.14.0/

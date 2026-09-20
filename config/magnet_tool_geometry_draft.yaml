@@ -1,0 +1,52 @@
+# Diagnostic-only data. NOT loaded by the live robot/MoveIt launch.
+# Missing geometry or unconfirmed placements must never authorize execution.
+status: incomplete_draft
+execution_allowed: false
+date: '2026-09-19'
+frame: tool0
+length_unit: m
+
+user_measurements:
+  motor_square_end_face_m: [0.043, 0.043]
+  motor_axial_length_m: 0.042
+  bracket_thickness_m: 0.008
+  bracket_thickness_midplane_passes_flange_center: true
+  bracket_thickness_along_motor_axis_confirmed: true
+  other_bracket_dimensions_description: '用户描述与电机大小差不多；无精确外形尺寸'
+  cable_motion_clearance_reported_by_user: true
+  photos:
+    - /home/yc/UR3/docs/images/hardware/末端正面.jpg
+    - /home/yc/UR3/docs/images/hardware/末端侧面小球正面.jpg
+    - /home/yc/UR3/docs/images/hardware/末端侧面电机底部.jpg
+
+previously_confirmed:
+  magnet_center_xyz_m: [0.0, -0.062, 0.041]
+  magnet_radius_m: 0.010
+  motor_to_sphere_axis: [0.0, -1.0, 0.0]
+
+# Conditional interpretation: bracket thickness along tool0 Y, bracket's
+# motor-side face at Y=+4 mm; 42 mm body extends to +Y. Shaft center X=0,Z=41 mm.
+# The 43 mm square faces are assumed aligned with tool0 X/Z.
+conditional_motor_body:
+  placement_confirmed: false
+  min_xyz_m: [-0.0215, 0.004, 0.0195]
+  max_xyz_m: [0.0215, 0.046, 0.0625]
+  excludes: [connector, protruding_screws, wiring, bracket, connecting_rod]
+
+# Deliberately larger than the known motor/sphere/shaft-center dimensions.
+# Bounds are a PROPOSED enclosing volume, not measured physical dimensions.
+# Inclusion of bracket/protrusions is still subject to onsite verification.
+# No possible successful diagnostic grants real-hardware execution permission.
+provisional_whole_tool_envelope:
+  verified_encloses_all_rigid_parts: false
+  min_xyz_m: [-0.030, -0.075, -0.005]
+  max_xyz_m: [0.030, 0.050, 0.070]
+  cable_geometry_included: false
+  based_on: '实测电机/球心尺寸、照片及用户对固定件大小的描述，额外放大；不是逐项测量结果'
+
+missing_for_complete_collision_model:
+  # Verifying the proposed envelope encloses the parts is sufficient for a
+  # conservative clearance test; exact dimensions of every part are optional.
+  - verify_whole_tool_envelope_encloses_bracket_rod_and_protrusions
+  - platform_supports_and_other_relevant_obstacles
+# Cable freedom is a user/onsite assessment, not a modeled or universal guarantee.

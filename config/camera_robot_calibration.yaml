@@ -1,0 +1,76 @@
+# FLIR/UR3 calibration accepted on 2026-09-18.
+# Samples: /home/yc/UR3/camera/calibration_samples/samples.yaml
+# Solver:  /home/yc/UR3/camera/solve_camera_robot_calibration.py
+camera:
+  serial: "22165884"
+  image_size_px: [2448, 2048]
+  camera_matrix:
+    - [3625.088677168018, 0.0, 1200.123248394464]
+    - [0.0, 3630.425985277284, 1067.173693198475]
+    - [0.0, 0.0, 1.0]
+  # OpenCV order: [k1, k2, p1, p2, k3].
+  distortion_coefficients: [-0.274982454144, 1.568575307653, 0.0, 0.0, 0.0]
+
+marker:
+  dictionary: DICT_ARUCO_ORIGINAL
+  id: 450
+  black_outer_edge_m: 0.100
+  active_tcp_xyz_m: [0.0, 0.0, 0.060]
+  # p_tcp = T_tcp_from_marker * p_marker.  The small fitted offset represents
+  # real mounting/printing tolerance around the nominal centred 60 mm mount.
+  T_tcp_from_marker:
+    - [-0.020027879792, -0.999700110073, 0.014091626996, 0.001010038768]
+    - [0.999782844075, -0.020106723333, -0.005475798500, 0.000004450582]
+    - [0.005757492809, 0.013978898281, 0.999885714309, 0.000854059569]
+    - [0.0, 0.0, 0.0, 1.0]
+
+transforms:
+  # p_camera = T_camera_from_base * p_base.
+  T_camera_from_base:
+    - [-0.999756788540, -0.021654287004, -0.004177992719, 0.080698782936]
+    - [-0.021648268078, 0.999764552563, -0.001480516317, 0.413433710704]
+    - [0.004209068547, -0.001389709932, -0.999990176176, 0.853275755880]
+    - [0.0, 0.0, 0.0, 1.0]
+  T_base_from_camera:
+    - [-0.999756788540, -0.021648268078, 0.004209068547, 0.086037783723]
+    - [-0.021654287004, 0.999764552563, -0.001389709932, -0.410403088396]
+    - [-0.004177992719, -0.001480516317, -0.999990176176, 0.854216627732]
+    - [0.0, 0.0, 0.0, 1.0]
+  # p_camera = T_camera_from_world * p_world.
+  T_camera_from_world:
+    - [0.999890347790, 0.014257959052, -0.004000437248, -0.189888210582]
+    - [0.014251795222, -0.999897212560, -0.001565225255, 0.159303048662]
+    - [-0.004022343123, 0.001508040304, -0.999990773594, 0.870934684439]
+    - [0.0, 0.0, 0.0, 1.0]
+  T_world_from_camera:
+    - [0.999890347283, 0.014251794678, -0.004022342970, 0.191100232488]
+    - [0.014257959599, -0.999897213285, 0.001508040211, 0.160680688334]
+    - [-0.004000437394, -0.001565225347, -0.999990772892, 0.870416357502]
+    - [0.0, 0.0, 0.0, 1.0]
+
+acrylic_plane:
+  world_z_m: 0.498141
+  camera_height_above_plane_m: 0.372275357502
+  # These homographies expect an UNDISTORTED pixel.  Raw camera pixels must
+  # first be passed through cv2.undistortPoints(..., P=camera_matrix).
+  H_undistorted_pixel_from_world_xy:
+    - [9709.980061948285, 143.499052832524, -665.726593977992]
+    - [127.274055241, -9732.994147326901, 2610.923500909736]
+    - [-0.010789596771, 0.004045191148, 1.0]
+  H_world_xy_from_undistorted_pixel:
+    - [0.000103078658415, 0.000001546589360, 0.064584177671]
+    - [0.000001644476475, -0.000102647465603, 0.269099451973]
+    - [0.000001105524938, 0.000000431915695, 1.0]
+
+quality:
+  sample_count: 14
+  intrinsic_reprojection_rms_px: 0.290781
+  robot_camera_reprojection_rms_px: 1.234756
+  robot_camera_reprojection_max_px: 3.302854
+  tcp_marker_position_error_mean_mm: 0.299114
+  tcp_marker_position_error_rms_mm: 0.382017
+  tcp_marker_position_error_max_mm: 0.945815
+  tcp_marker_rotation_error_mean_deg: 0.340441
+  tcp_marker_rotation_error_rms_deg: 0.375011
+  tcp_marker_rotation_error_max_deg: 0.663820
+  aruco_id_decode_failures: [sample_010]
