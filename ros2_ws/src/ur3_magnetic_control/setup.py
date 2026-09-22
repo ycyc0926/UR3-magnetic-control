@@ -11,25 +11,19 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="yc",
     maintainer_email="yc@localhost.localdomain",
-    description="Safe ROS 2 scaffolding for UR3 visual magnetic control.",
+    description="Reusable guarded UR3 vision and magnet-centre control.",
     license="BSD-3-Clause",
     entry_points={
         "console_scripts": [
             "camera_node = ur3_magnetic_control.camera_node:main",
-            "target_tracker = ur3_magnetic_control.target_tracker:main",
-            "path_publisher = ur3_magnetic_control.path_publisher:main",
-            "mock_motor = ur3_magnetic_control.mock_motor:main",
-            "safety_supervisor = ur3_magnetic_control.safety_supervisor:main",
-            "cartesian_line_move = ur3_magnetic_control.cartesian_line_move:main",
-            "cartesian_orientation_move = ur3_magnetic_control.cartesian_orientation_move:main",
-            "level_magnet_axis = ur3_magnetic_control.level_magnet_axis:main",
+            "h_tracker_node = ur3_magnetic_control.h_tracker_node:main",
+            "magnet_trajectory = ur3_magnetic_control.magnet_trajectory:main",
         ],
     },
 )

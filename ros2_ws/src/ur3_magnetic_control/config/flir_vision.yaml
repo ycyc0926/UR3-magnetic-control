@@ -15,12 +15,9 @@ camera_node:
       ! video/x-raw,format=BGR,width=1224,height=1024
       ! appsink drop=true max-buffers=1 sync=false
 
-target_tracker:
+h_tracker:
   ros__parameters:
-    minimum_area_px: 500.0
-
-safety_supervisor:
-  ros__parameters:
-    target_timeout_s: 0.2
-    robot_state_timeout_s: 0.2
-    require_robot_state: false
+    # Five-frame median center motion at or above this value keeps the clip.
+    recording_movement_threshold_mm: 0.5
+    # Static deletion requires reliable tracking; lower coverage is kept as indeterminate.
+    recording_minimum_detection_fraction: 0.8

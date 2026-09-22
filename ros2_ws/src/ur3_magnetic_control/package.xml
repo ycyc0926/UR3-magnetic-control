@@ -2,25 +2,25 @@
 <package format="3">
   <name>ur3_magnetic_control</name>
   <version>0.1.0</version>
-  <description>Safe ROS 2 scaffolding for the UR3 vision-guided magnetic actuation experiment.</description>
+  <description>Reusable guarded UR3 vision and magnet-centre control.</description>
   <maintainer email="yc@localhost.localdomain">yc</maintainer>
   <license>BSD-3-Clause</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>control_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>moveit_msgs</exec_depend>
-  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>shape_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>ros2launch</exec_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

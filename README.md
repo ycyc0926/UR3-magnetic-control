@@ -9,8 +9,8 @@
 | 目录 | 内容 |
 |---|---|
 | `config/` | 唯一的系统、标定、工具和场景配置 |
-| `ros2_ws/src/ur3_magnetic_control/` | 正式 ROS 2 Python 包、launch 文件和包内测试 |
-| `robot/` | UR3 专用规划、只读监控、受保护执行器和离线碰撞检查代码 |
+| `ros2_ws/src/ur3_magnetic_control/` | 正式 ROS 2 Python 包、统一轨迹入口和包内测试 |
+| `robot/` | UR3 文档、只读监控、标定版 MoveIt 启动和离线碰撞工具 |
 | `camera/` | 相机启动、标定脚本和 H 跟踪入口 |
 | `camera/tracking_sessions/` | 相机原始实验记录，不属于源代码 |
 | `robot/planning_checks/` | 机械臂规划和执行审计记录，不是可直接重放的命令 |
@@ -44,8 +44,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider \
   /home/yc/UR3/robot/tests
 ```
 
-详细入口见 [机械臂说明](robot/README.md)、[相机说明](camera/README.md)和
-[ROS 2 环境说明](docs/setup/ROS2.md)。H 移动录像的快捷入口位于
+详细入口见 [机械臂说明](robot/README.md)、[统一磁铁轨迹说明](robot/MAGNET_TRAJECTORY.md)、
+[相机说明](camera/README.md)和 [ROS 2 环境说明](docs/setup/ROS2.md)。H 移动录像的快捷入口位于
 [`camera/motion_examples/`](camera/motion_examples/README.md)。
 
 ## 当前安全配置
@@ -53,12 +53,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider \
 全局净空策略只允许在
 `config/ur3_system.yaml:safety.clearance_policy_m` 中配置：
 
-- 亚克力板底净空：5 mm
+- 亚克力板底净空：进入亚克力覆盖区域时为 5 mm
 - 左、右侧净空：各 10 mm
 - 桌面净空：10 mm
 
 运动脚本不得分别覆盖板底或左右侧净空。历史报告中出现的其他阈值仅描述当时
 工况，不符合当前配置时不得复用。
+
+2026-09-22 记录的亚克力内侧左下角世界坐标为 `(X,Y)=(135,25) mm`。当前有限
+板面模型只启用用户明确说明的 Y 边界：一个 link/工具的完整世界坐标包络满足
+`max(Y) < 25 mm` 时，不受亚克力板底高度约束；到达或跨越 `Y=25 mm` 时仍执行
+5 mm 板底净空检查。`X=135 mm` 已记录，但尚未作为高度豁免边界。
 
 ## 数据保留原则
 

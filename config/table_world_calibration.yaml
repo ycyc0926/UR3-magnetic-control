@@ -42,3 +42,11 @@ fixed_work_surface:
   acrylic_thickness_m: 0.007400
   acrylic_top_world_z_m: 0.498141
   paper_thickness_m: null
+  acrylic_footprint:
+    # User-reported inner lower-left corner, recorded 2026-09-22.
+    inner_lower_left_world_xy_m: [0.135, 0.025]
+    measurement_source: user_reported_2026-09-22
+    # The current verified exemption is only below the lower Y edge. The X
+    # coordinate is recorded but is not yet used to remove the height guard.
+    ceiling_region_model: world_y_at_or_above_lower_edge
+    x_boundary_usage: recorded_only_not_used_for_ceiling_exemption

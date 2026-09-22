@@ -1,0 +1,5 @@
+相机：
+xdg-open 'http://127.0.0.1:8767/'
+如果页面提示无法连接，先启动相机服务：
+bash /home/yc/UR3/camera/start_h_tracking.sh
+保持该终端运行，再执行打开网页的命令。

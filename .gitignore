@@ -29,6 +29,12 @@ camera/calibration_samples/*.png
 
 robot/planning_checks/*
 !robot/planning_checks/README.md
+robot/trajectory_runs/
+
+# Local hardware CAD, vendor archives and datasheets are not source code.
+# Keep them on the experiment computer unless a separate artifact repository
+# is chosen for the binary assets.
+motor and magnet/
 
 # Reference PDFs and the full upstream driver snapshot are not needed to run
 # this repository. The locally patched ur_calibration package is committed

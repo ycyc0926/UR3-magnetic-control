@@ -1,9 +1,9 @@
-"""MoveIt collision guard for the fixed acrylic underside and side planes.
+"""MoveIt collision guard for the finite acrylic underside and side planes.
 
-The calibrated acrylic underside is an absolute ceiling: no UR collision
-geometry or attached magnetic sphere may enter the forbidden half-space above
-it. The side-panel inner faces are treated the same way. All margins come from
-the single project-wide clearance policy.
+The underside height guard begins at the measured world Y lower edge. Geometry
+wholly below that edge is outside the acrylic footprint; geometry touching or
+crossing it remains constrained. Side-panel guards remain global. All margins
+come from the single project-wide clearance policy.
 """
 
 from pathlib import Path
@@ -18,6 +18,7 @@ from moveit_msgs.srv import ApplyPlanningScene, GetStateValidity
 from shape_msgs.msg import SolidPrimitive
 import yaml
 
+from .acrylic_geometry import acrylic_inner_lower_left_world_xy_m
 from .clearance_policy import load_clearance_limits_m
 
 
@@ -26,6 +27,7 @@ CEILING_OBJECT_ID = "acrylic_ceiling_forbidden"
 LEFT_OBJECT_ID = "acrylic_left_clearance_forbidden"
 RIGHT_OBJECT_ID = "acrylic_right_clearance_forbidden"
 MAGNET_OBJECT_ID = "magnet_sphere_guard"
+CEILING_REGION_SPAN_M = 2.0
 
 
 def _project_root():
@@ -50,6 +52,7 @@ def load_guard_configuration():
     underside = float(
         world["fixed_work_surface"]["acrylic_bottom_world_z_m"]
     )
+    corner_x, lower_edge_y = acrylic_inner_lower_left_world_xy_m(world)
     clearance_limits = load_clearance_limits_m(root)
     ceiling_clearance = clearance_limits["ceiling"]
     left_guard = float(sides["left_inner_x_m"]) + clearance_limits["left"]
@@ -79,6 +82,9 @@ def load_guard_configuration():
         "underside_world_z_m": underside,
         "clearance_limits_m": clearance_limits,
         "guard_world_z_m": underside - ceiling_clearance,
+        "acrylic_inner_lower_left_world_xy_m": [corner_x, lower_edge_y],
+        "ceiling_region_min_world_y_m": lower_edge_y,
+        "table_geometry": world,
         "left_guard_world_x_m": left_guard,
         "right_guard_world_x_m": right_guard,
         "T_base_from_world": [[float(value) for value in row] for row in transform],
@@ -178,14 +184,17 @@ class AcrylicCeilingGuard:
         return collision
 
     def _forbidden_ceiling_object(self):
-        # The lower face is the guarded ceiling. The other dimensions cover
-        # the full UR3 work envelope and all space above it.
-        box_xy_m = 2.0
+        # The lower Z face is the guarded underside. The lower Y face is the
+        # measured acrylic edge; Y below it remains outside this object.
+        box_x_m = 2.0
+        box_y_m = CEILING_REGION_SPAN_M
         box_height_m = 1.0
+        lower_y = self.configuration["ceiling_region_min_world_y_m"]
         return self._world_box(
             CEILING_OBJECT_ID,
-            [0.0, 0.0, self.configuration["guard_world_z_m"] + box_height_m / 2.0],
-            [box_xy_m, box_xy_m, box_height_m],
+            [0.0, lower_y + box_y_m / 2.0,
+             self.configuration["guard_world_z_m"] + box_height_m / 2.0],
+            [box_x_m, box_y_m, box_height_m],
         )
 
     def _forbidden_side_objects(self):
@@ -289,6 +298,7 @@ class AcrylicCeilingGuard:
         return (
             f"ACRYLIC_UNDERSIDE_WORLD_Z={values['underside_world_z_m'] * 1000.0:.3f}mm "
             f"GUARD_Z={values['guard_world_z_m'] * 1000.0:.3f}mm "
+            f"ACRYLIC_LOWER_EDGE_Y={values['ceiling_region_min_world_y_m'] * 1000.0:.3f}mm "
             f"BOTTOM_CLEARANCE={limits['ceiling'] * 1000.0:.3f}mm "
             f"SIDE_CLEARANCE={limits['left'] * 1000.0:.3f}mm"
         )

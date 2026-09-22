@@ -11,7 +11,7 @@ import urllib.request
 import cv2
 import numpy as np
 
-from ur3_magnetic_control.h_preview_web import LocalPreview
+from ur3_magnetic_control.h_preview_web import LocalPreview, PAGE
 from ur3_magnetic_control.h_recording import BoundedRecorder
 from ur3_magnetic_control.h_tracking import DarkTargetTracker, PlaneMapper, reference_path
 
@@ -100,6 +100,70 @@ class RecorderTests(unittest.TestCase):
             self.assertFalse(metadata['controls_motor'])
             self.assertFalse(metadata['active'])
             self.assertAlmostEqual(metadata['max_received_frame_gap_s'], .05)
+            self.assertEqual(metadata['classification'], 'indeterminate')
+            self.assertTrue(metadata['kept'])
+
+    def test_moving_center_keeps_video_and_draws_trajectory(self):
+        with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
+            recorder = BoundedRecorder(directory, reserve_bytes=0)
+            recorder.start(5)
+            for index in range(30):
+                recorder.write(frame(), 10**9+index*50_000_000, True, 'tracked',
+                               [100+index*.1, 80+index*.03])
+            recorder.stop()
+            status = recorder.status()
+            self.assertEqual(status['classification'], 'moving')
+            self.assertTrue(status['kept'])
+            self.assertGreater(status['motion']['center_span_mm'], 2.5)
+            self.assertTrue((recorder.directory/'unannotated.avi').is_file())
+            self.assertTrue((recorder.directory/'trajectory.png').is_file())
+            self.assertTrue(status['trajectory_available'])
+            with (recorder.directory/'frame_times.csv').open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertAlmostEqual(float(rows[-1]['world_x_mm']), 102.9)
+
+    def test_static_center_is_discarded_after_recording(self):
+        with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
+            recorder = BoundedRecorder(directory, reserve_bytes=0)
+            recorder.start(5)
+            clip = recorder.directory
+            for index in range(30):
+                jitter = .02*np.sin(index)
+                recorder.write(frame(), 10**9+index*50_000_000, True, 'tracked',
+                               [100+jitter, 80-jitter])
+            recorder.stop()
+            status = recorder.status()
+            self.assertEqual(status['classification'], 'static')
+            self.assertFalse(status['kept'])
+            self.assertEqual(status['reason'], 'discarded_no_center_motion')
+            self.assertIsNone(recorder.directory)
+            self.assertFalse(clip.exists())
+            self.assertLess(status['motion']['center_span_mm'], .5)
+
+    def test_single_center_outlier_does_not_keep_static_video(self):
+        with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
+            recorder = BoundedRecorder(directory, reserve_bytes=0)
+            recorder.start(5)
+            for index in range(30):
+                position = [105, 81] if index == 15 else [100, 80]
+                recorder.write(frame(), 10**9+index*50_000_000, True, 'tracked', position)
+            recorder.stop()
+            self.assertEqual(recorder.status()['classification'], 'static')
+
+    def test_tracking_gap_is_kept_instead_of_risking_false_static_deletion(self):
+        with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
+            recorder = BoundedRecorder(directory, reserve_bytes=0)
+            recorder.start(5)
+            for index in range(30):
+                detected = index < 10
+                recorder.write(frame(), 10**9+index*50_000_000, detected,
+                               'tracked' if detected else 'locked_out',
+                               [100, 80] if detected else None)
+            recorder.stop()
+            status = recorder.status()
+            self.assertEqual(status['classification'], 'indeterminate')
+            self.assertTrue(status['kept'])
+            self.assertTrue(recorder.directory.exists())
 
     def test_deadline_ends_only_recording(self):
         with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
@@ -132,6 +196,10 @@ class RecorderTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    def test_page_has_no_embedded_arm_control(self):
+        for fragment in ('arm-control', 'arm-panel', 'arm-waiting-button', 'ARM_PANEL_URL'):
+            self.assertNotIn(fragment, PAGE)
+
     def test_commands_are_validated_and_queued(self):
         web = LocalPreview(port=0)
         port = web.server.server_address[1]

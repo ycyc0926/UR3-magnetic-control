@@ -1,0 +1,2473 @@
+#!/usr/bin/env python3
+"""Reusable guarded Cartesian paths expressed at the magnet centre.
+
+The command accepts absolute magnet-centre coordinates in ``table_world`` and
+keeps the current tool orientation fixed.  It can generate a point move, a
+closed square, a closed circle, or a path loaded from YAML/JSON/CSV.  Planning
+is the default; real execution requires explicit, fresh onsite confirmations.
+
+An optional final motor-axis constraint can rotate the tool about the magnet
+centre and align the verified shaft direction with a selected ``table_world``
+axis.  The default alignment order translates first and rotates at the final
+magnet centre; this keeps the requested point fixed during the orientation
+change.
+
+This is an application-level guard, not a certified safety function.  The
+current whole-tool envelope is deliberately conservative but still marked as
+provisional because cables and some bracket details have not been measured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+from collections import deque
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Pose
+from moveit_msgs.msg import (
+    AttachedCollisionObject,
+    CollisionObject,
+    MoveItErrorCodes,
+    PlanningScene,
+    RobotTrajectory,
+)
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionFK
+from rcl_interfaces.srv import GetParameters
+from scipy.spatial.transform import Rotation
+from shape_msgs.msg import SolidPrimitive
+from trajectory_msgs.msg import JointTrajectory
+import yaml
+
+from .acrylic_ceiling_guard import AcrylicCeilingGuard, DEFAULT_PROJECT_ROOT
+from .acrylic_geometry import modeled_boundary_gaps_m
+from .cartesian_line_move import (
+    CartesianLineMove,
+    EXECUTION_TOKEN,
+    duration_seconds,
+    set_duration,
+)
+from .ceiling_geometry import CeilingGeometry, sample_trajectory
+from .clearance_policy import load_clearance_limits_m
+
+
+JOINT_NAMES = (
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+)
+TOOL_OBJECT_ID = "provisional_complete_magnet_tool"
+TABLE_OBJECT_ID = "table_clearance_forbidden"
+PATH_SCHEMA = "ur3_magnet_centre_path/v1"
+MAX_CARTESIAN_STEP_M = 0.002
+MAX_SEGMENT_M = 0.300
+MAX_TOTAL_PATH_M = 1.000
+MAX_TARGETS = 600
+MAX_DURATION_S = 300.0
+# Independently planned Cartesian chunks intentionally come to rest at every
+# chunk boundary.  A reviewed ingress route can therefore be slower than an
+# ordinary continuous path even though all velocity limits remain unchanged.
+MAX_SEGMENTED_DURATION_S = 420.0
+PLANNED_JOINT_SPEED_LIMIT_RAD_S = math.radians(5.0)
+PLANNED_JOINT_ACCELERATION_LIMIT_RAD_S2 = 5.0
+MEASURED_JOINT_SPEED_LIMIT_RAD_S = math.radians(7.0)
+PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S = math.radians(5.0)
+MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S = math.radians(7.0)
+STOPPING_RESERVE_M = 0.002
+LIVE_PATH_TOLERANCE_M = 0.002
+PLANNED_PATH_TOLERANCE_M = 0.00075
+FINAL_POSITION_TOLERANCE_M = 0.00075
+FINAL_AXIS_TOLERANCE_RAD = math.radians(0.25)
+PLANNED_ORIENTATION_PATH_TOLERANCE_RAD = math.radians(0.50)
+LIVE_ORIENTATION_PATH_TOLERANCE_RAD = math.radians(1.0)
+ORIENTATION_WAYPOINT_STEP_RAD = math.radians(1.0)
+POSE_GUARD_POSITION_STEP_M = 0.001
+POSE_GUARD_ORIENTATION_STEP_RAD = math.radians(0.25)
+TRACE_INTERVAL_S = 0.02
+COLLISION_SUBDIVISIONS_PER_SEGMENT = 4
+WORKSPACE_INGRESS_TOLERANCE_M = 0.0001
+MIN_PLANNING_CHUNK_M = 0.002
+MAX_PLANNING_CHUNK_M = 0.050
+
+
+def project_root() -> Path:
+    return Path(os.environ.get("UR3_PROJECT_ROOT", DEFAULT_PROJECT_ROOT))
+
+
+def finite_point(values, label="point") -> np.ndarray:
+    point = np.asarray(values, dtype=float)
+    if point.shape != (3,) or not np.isfinite(point).all():
+        raise ValueError(f"{label} must contain exactly three finite values")
+    return point
+
+
+def homogeneous_point(transform, point) -> np.ndarray:
+    transform = np.asarray(transform, dtype=float)
+    point = finite_point(point)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError("transform must be a finite 4x4 matrix")
+    return (transform @ np.r_[point, 1.0])[:3]
+
+
+def quaternion_matrix(pose: Pose) -> np.ndarray:
+    quaternion = [
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    ]
+    if not np.isfinite(quaternion).all() or np.linalg.norm(quaternion) < 1.0e-9:
+        raise ValueError("invalid tool orientation")
+    return Rotation.from_quat(quaternion).as_matrix()
+
+
+def normalized_vector(value, label="vector") -> np.ndarray:
+    vector = finite_point(value, label)
+    norm = float(np.linalg.norm(vector))
+    if norm < 1.0e-12:
+        raise ValueError(f"{label} must be nonzero")
+    return vector / norm
+
+
+def rotation_between_vectors(source, target) -> Rotation:
+    """Return the deterministic minimum-angle rotation from source to target."""
+    source = normalized_vector(source, "source vector")
+    target = normalized_vector(target, "target vector")
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    cross = np.cross(source, target)
+    sine = float(np.linalg.norm(cross))
+    if sine > 1.0e-12:
+        return Rotation.from_rotvec(cross / sine * math.atan2(sine, cosine))
+    if cosine > 0.0:
+        return Rotation.identity()
+    # Antiparallel vectors admit infinitely many pi rotations.  Pick the
+    # least-aligned Cartesian basis deterministically and make a perpendicular
+    # axis from it, avoiding numerical instability near 180 degrees.
+    basis = np.eye(3)[int(np.argmin(np.abs(source)))]
+    axis = normalized_vector(np.cross(source, basis), "antiparallel axis")
+    return Rotation.from_rotvec(axis * math.pi)
+
+
+def parallel_axis_target_rotation(
+    start_rotation_world,
+    motor_axis_tool,
+    world_axis,
+    direction="nearest",
+    roll_deg=0.0,
+):
+    """Choose and construct a minimum-turn tool rotation for an axis constraint."""
+    start = Rotation.from_matrix(np.asarray(start_rotation_world, dtype=float))
+    motor_axis_tool = normalized_vector(motor_axis_tool, "motor axis in tool")
+    if world_axis not in ("x", "y", "z"):
+        raise ValueError("world axis must be x, y, or z")
+    if direction not in ("nearest", "positive", "negative"):
+        raise ValueError("axis direction must be nearest, positive, or negative")
+    basis = np.eye(3)[("x", "y", "z").index(world_axis)]
+    current_axis = normalized_vector(
+        start.as_matrix() @ motor_axis_tool,
+        "current motor axis",
+    )
+    if direction == "positive":
+        target_axis = basis
+        selected_direction = "positive"
+    elif direction == "negative":
+        target_axis = -basis
+        selected_direction = "negative"
+    elif float(np.dot(current_axis, basis)) >= 0.0:
+        target_axis = basis
+        selected_direction = "positive"
+    else:
+        target_axis = -basis
+        selected_direction = "negative"
+    delta = rotation_between_vectors(current_axis, target_axis)
+    target = delta * start
+    roll_deg = float(roll_deg)
+    if not math.isfinite(roll_deg) or not -180.0 <= roll_deg <= 180.0:
+        raise ValueError("motor-axis roll must be within [-180, 180] degrees")
+    if abs(roll_deg) > 1.0e-12:
+        target = (
+            Rotation.from_rotvec(target_axis * math.radians(roll_deg))
+            * target
+        )
+    angle = float((start.inv() * target).magnitude())
+    final_axis = target.as_matrix() @ motor_axis_tool
+    error = math.acos(float(np.clip(np.dot(final_axis, target_axis), -1.0, 1.0)))
+    if error > 1.0e-9:
+        raise RuntimeError("failed to construct the requested motor-axis rotation")
+    return {
+        "rotation_world_tool": target.as_matrix(),
+        "current_axis_world": current_axis,
+        "target_axis_world": target_axis.copy(),
+        "selected_direction": selected_direction,
+        "roll_deg": roll_deg,
+        "rotation_angle_rad": angle,
+    }
+
+
+def interpolate_rotations(start_rotation, target_rotation, maximum_step_rad):
+    """Return a geodesic rotation sequence including start and target."""
+    maximum_step_rad = float(maximum_step_rad)
+    if not math.isfinite(maximum_step_rad) or maximum_step_rad <= 0.0:
+        raise ValueError("orientation step must be finite and positive")
+    start = Rotation.from_matrix(np.asarray(start_rotation, dtype=float))
+    target = Rotation.from_matrix(np.asarray(target_rotation, dtype=float))
+    relative = start.inv() * target
+    rotation_vector = relative.as_rotvec()
+    angle = float(np.linalg.norm(rotation_vector))
+    count = max(1, int(math.ceil(angle / maximum_step_rad)))
+    return [
+        (start * Rotation.from_rotvec(rotation_vector * (index / count))).as_matrix()
+        for index in range(count + 1)
+    ]
+
+
+def sample_pose_guard_path(
+    route,
+    start_rotation_world,
+    target_rotation_world=None,
+    alignment_phase="after",
+):
+    """Densely sample allowed (magnet-centre, tool-orientation) pairs."""
+    route = [finite_point(point, f"pose route point {index}")
+             for index, point in enumerate(route)]
+    if len(route) < 2:
+        raise ValueError("pose guard route must contain at least two points")
+    start_rotation_world = np.asarray(start_rotation_world, dtype=float)
+    if alignment_phase not in ("before", "after"):
+        raise ValueError("alignment phase must be before or after")
+
+    translation_rotation = (
+        start_rotation_world
+        if target_rotation_world is None or alignment_phase == "after"
+        else np.asarray(target_rotation_world, dtype=float)
+    )
+    translation_centres = [route[0]]
+    for left, right in zip(route, route[1:]):
+        distance = float(np.linalg.norm(right - left))
+        count = max(1, int(math.ceil(distance / POSE_GUARD_POSITION_STEP_M)))
+        translation_centres.extend(
+            left + (right - left) * (index / count)
+            for index in range(1, count + 1)
+        )
+    translation_rotations = [translation_rotation] * len(translation_centres)
+
+    if target_rotation_world is None:
+        centres = translation_centres
+        rotations = translation_rotations
+    else:
+        rotation_path = interpolate_rotations(
+            start_rotation_world,
+            target_rotation_world,
+            POSE_GUARD_ORIENTATION_STEP_RAD,
+        )
+        rotation_centre = route[0] if alignment_phase == "before" else route[-1]
+        rotation_centres = [rotation_centre] * len(rotation_path)
+        if alignment_phase == "before":
+            centres = [*rotation_centres, *translation_centres[1:]]
+            rotations = [*rotation_path, *translation_rotations[1:]]
+        else:
+            centres = [*translation_centres, *rotation_centres[1:]]
+            rotations = [*translation_rotations, *rotation_path[1:]]
+    quaternions = np.asarray(
+        [Rotation.from_matrix(rotation).as_quat() for rotation in rotations],
+        dtype=float,
+    )
+    return np.asarray(centres, dtype=float), quaternions
+
+
+def orientation_path_distance(
+    magnet_world,
+    quaternion_world_tool,
+    path_centres,
+    path_quaternions,
+    position_radius_m,
+):
+    """Smallest orientation error among allowed poses near a magnet position."""
+    point = finite_point(magnet_world, "magnet centre")
+    quaternion = np.asarray(quaternion_world_tool, dtype=float)
+    centres = np.asarray(path_centres, dtype=float)
+    quaternions = np.asarray(path_quaternions, dtype=float)
+    if (
+        quaternion.shape != (4,)
+        or centres.ndim != 2
+        or centres.shape[1:] != (3,)
+        or quaternions.shape != (len(centres), 4)
+        or not np.isfinite([*quaternion, *centres.ravel(), *quaternions.ravel()]).all()
+    ):
+        raise ValueError("invalid pose path")
+    quaternion_norm = float(np.linalg.norm(quaternion))
+    quaternion_norms = np.linalg.norm(quaternions, axis=1)
+    if quaternion_norm < 1.0e-12 or np.any(quaternion_norms < 1.0e-12):
+        raise ValueError("pose path contains an invalid quaternion")
+    distances = np.linalg.norm(centres - point, axis=1)
+    candidates = distances <= float(position_radius_m)
+    if not np.any(candidates):
+        candidates[int(np.argmin(distances))] = True
+    normalized = quaternions[candidates] / quaternion_norms[candidates, None]
+    dots = np.abs(normalized @ (quaternion / quaternion_norm))
+    angles = 2.0 * np.arccos(np.clip(dots, 0.0, 1.0))
+    return float(np.min(angles))
+
+
+def build_point_targets(target_mm) -> tuple[list[np.ndarray], dict]:
+    target = finite_point(target_mm, "target") / 1000.0
+    return [target], {"shape": "point", "target_world_mm": list(map(float, target_mm))}
+
+
+def build_square_targets(center_mm, size_mm, rotation_deg=0.0, clockwise=False):
+    center = finite_point(center_mm, "square center") / 1000.0
+    size = float(size_mm) / 1000.0
+    angle = float(rotation_deg)
+    if not math.isfinite(size) or not 0.001 <= size <= 0.300:
+        raise ValueError("square size must be within [1, 300] mm")
+    if not math.isfinite(angle):
+        raise ValueError("square rotation must be finite")
+    half = size / 2.0
+    if clockwise:
+        xy = [(-half, -half), (-half, half), (half, half), (half, -half)]
+    else:
+        xy = [(-half, -half), (half, -half), (half, half), (-half, half)]
+    rotation = Rotation.from_euler("z", angle, degrees=True).as_matrix()[:2, :2]
+    points = []
+    for value in [*xy, xy[0]]:
+        offset = rotation @ np.asarray(value)
+        points.append(center + [offset[0], offset[1], 0.0])
+    return points, {
+        "shape": "square",
+        "center_world_mm": list(map(float, center_mm)),
+        "size_mm": float(size_mm),
+        "rotation_deg": angle,
+        "clockwise": bool(clockwise),
+    }
+
+
+def build_circle_targets(
+    center_mm,
+    radius_mm,
+    samples=None,
+    clockwise=False,
+    start_angle_deg=0.0,
+):
+    center = finite_point(center_mm, "circle center") / 1000.0
+    radius = float(radius_mm) / 1000.0
+    start = float(start_angle_deg)
+    if not math.isfinite(radius) or not 0.0005 <= radius <= 0.150:
+        raise ValueError("circle radius must be within [0.5, 150] mm")
+    if not math.isfinite(start):
+        raise ValueError("circle start angle must be finite")
+    minimum = max(24, int(math.ceil(2.0 * math.pi * radius / MAX_CARTESIAN_STEP_M)))
+    count = minimum if samples is None else int(samples)
+    if count < minimum or count > MAX_TARGETS - 1:
+        raise ValueError(
+            f"circle samples must be within [{minimum}, {MAX_TARGETS - 1}] "
+            "so every chord is no longer than 2 mm"
+        )
+    direction = -1.0 if clockwise else 1.0
+    angles = np.linspace(
+        math.radians(start), math.radians(start) + direction * 2.0 * math.pi,
+        count + 1,
+    )
+    points = [
+        center + [radius * math.cos(angle), radius * math.sin(angle), 0.0]
+        for angle in angles
+    ]
+    return points, {
+        "shape": "circle",
+        "center_world_mm": list(map(float, center_mm)),
+        "radius_mm": float(radius_mm),
+        "samples": count,
+        "clockwise": bool(clockwise),
+        "start_angle_deg": start,
+    }
+
+
+def load_waypoint_targets(path: Path):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in (".yaml", ".yml", ".json"):
+        with path.open(encoding="utf-8") as stream:
+            data = json.load(stream) if suffix == ".json" else yaml.safe_load(stream)
+        if isinstance(data, dict):
+            if data.get("frame", "table_world") != "table_world":
+                raise ValueError("waypoint file frame must be table_world")
+            values = data.get("waypoints_mm")
+        else:
+            values = data
+    elif suffix == ".csv":
+        with path.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        required = {"x_mm", "y_mm", "z_mm"}
+        if not rows or not required.issubset(rows[0]):
+            raise ValueError("CSV requires x_mm,y_mm,z_mm columns")
+        values = [[row["x_mm"], row["y_mm"], row["z_mm"]] for row in rows]
+    else:
+        raise ValueError("waypoint file must be YAML, JSON, or CSV")
+    if not isinstance(values, list) or not values:
+        raise ValueError("waypoint file contains no waypoints")
+    points = [finite_point(value, f"waypoint {index}") / 1000.0
+              for index, value in enumerate(values)]
+    if len(points) > MAX_TARGETS:
+        raise ValueError(f"at most {MAX_TARGETS} waypoints are allowed")
+    return points, {
+        "shape": "waypoints",
+        "source": str(path.resolve()),
+        "count": len(points),
+    }
+
+
+def route_length(points) -> float:
+    points = [finite_point(point) for point in points]
+    return float(sum(np.linalg.norm(right - left) for left, right in zip(points, points[1:])))
+
+
+def validate_route(start_world, targets_world):
+    start = finite_point(start_world, "current magnet center")
+    targets = [finite_point(value, f"target {index}")
+               for index, value in enumerate(targets_world)]
+    if not targets or len(targets) > MAX_TARGETS:
+        raise ValueError(f"target count must be within [1, {MAX_TARGETS}]")
+    route = [start, *targets]
+    segments = [float(np.linalg.norm(right - left))
+                for left, right in zip(route, route[1:])]
+    if any(length > MAX_SEGMENT_M for length in segments):
+        raise ValueError("a path segment exceeds the 300 mm limit")
+    total = sum(segments)
+    if total <= 1.0e-6 or total > MAX_TOTAL_PATH_M:
+        raise ValueError("total path length must be within (1, 1000] mm")
+    return route, segments, total
+
+
+def subdivide_route(route, maximum_chunk_m):
+    """Return ordered polyline targets no farther apart than ``maximum_chunk_m``."""
+    maximum_chunk_m = float(maximum_chunk_m)
+    if (
+        not math.isfinite(maximum_chunk_m)
+        or not MIN_PLANNING_CHUNK_M <= maximum_chunk_m <= MAX_PLANNING_CHUNK_M
+    ):
+        raise ValueError(
+            "planning chunk must be within "
+            f"[{MIN_PLANNING_CHUNK_M * 1000.0:.0f}, "
+            f"{MAX_PLANNING_CHUNK_M * 1000.0:.0f}] mm"
+        )
+    points = [finite_point(point, f"route point {index}")
+              for index, point in enumerate(route)]
+    if len(points) < 2:
+        raise ValueError("route must contain at least two points")
+    result = []
+    for left, right in zip(points, points[1:]):
+        distance = float(np.linalg.norm(right - left))
+        count = max(1, int(math.ceil(distance / maximum_chunk_m)))
+        result.extend(
+            left + (right - left) * (index / count)
+            for index in range(1, count + 1)
+        )
+    if len(result) > 2000:
+        raise ValueError("segmented route contains more than 2000 planning chunks")
+    return result
+
+
+def robot_state_after_trajectory(start_state, trajectory):
+    """Copy ``start_state`` and replace joints with a trajectory endpoint."""
+    if not trajectory.points:
+        raise ValueError("trajectory contains no points")
+    result = copy.deepcopy(start_state)
+    final = dict(zip(trajectory.joint_names, trajectory.points[-1].positions))
+    if any(name not in result.joint_state.name for name in final):
+        raise ValueError("trajectory endpoint contains an unknown joint")
+    result.joint_state.position = [
+        final.get(name, old)
+        for name, old in zip(
+            result.joint_state.name, result.joint_state.position
+        )
+    ]
+    result.joint_state.velocity = []
+    result.joint_state.effort = []
+    return result
+
+
+def concatenate_joint_trajectories(trajectories):
+    """Join independently time-parameterized, stationary-ended segments."""
+    trajectories = list(trajectories)
+    if not trajectories:
+        raise ValueError("no trajectories to concatenate")
+    combined = JointTrajectory()
+    combined.header = copy.deepcopy(trajectories[0].header)
+    combined.joint_names = list(trajectories[0].joint_names)
+    elapsed = 0.0
+    previous = None
+    for segment_index, source_trajectory in enumerate(trajectories):
+        trajectory = copy.deepcopy(source_trajectory)
+        if list(trajectory.joint_names) != list(combined.joint_names):
+            raise RuntimeError("segmented trajectories use different joint orders")
+        if len(trajectory.points) < 2:
+            raise RuntimeError(
+                f"planning chunk {segment_index} returned too few points"
+            )
+        segment_start = trajectory.points[0]
+        segment_duration = duration_seconds(
+            trajectory.points[-1].time_from_start
+        )
+        if segment_duration <= 0.0:
+            raise RuntimeError(
+                f"planning chunk {segment_index} has no time parameterization"
+            )
+        # Every independently parameterized chunk is a deliberate stop point.
+        # Normalize endpoint derivatives before joining so the controller sees
+        # an unambiguous stationary boundary rather than two acceleration
+        # values at the same position/time.  The modified splines are audited
+        # again after concatenation.
+        for endpoint in (trajectory.points[0], trajectory.points[-1]):
+            if endpoint.velocities:
+                maximum_velocity = float(np.max(np.abs(endpoint.velocities)))
+                if maximum_velocity > 1.0e-4:
+                    raise RuntimeError(
+                        f"planning chunk {segment_index} endpoint is not "
+                        f"stationary: {maximum_velocity:.6f} rad/s"
+                    )
+                endpoint.velocities = [0.0] * len(endpoint.velocities)
+            if endpoint.accelerations:
+                endpoint.accelerations = [0.0] * len(endpoint.accelerations)
+        if previous is not None:
+            mismatch = float(np.max(np.abs(
+                np.asarray(previous.positions, dtype=float)
+                - np.asarray(segment_start.positions, dtype=float)
+            )))
+            if mismatch > 1.0e-4:
+                raise RuntimeError(
+                    f"planning chunk {segment_index} start mismatch is "
+                    f"{mismatch:.6f} rad"
+                )
+            for field in ("velocities", "accelerations"):
+                left = np.asarray(getattr(previous, field), dtype=float)
+                right = np.asarray(getattr(segment_start, field), dtype=float)
+                if left.size and right.size and (
+                    left.shape != right.shape
+                    or float(np.max(np.abs(left - right))) > 1.0e-4
+                ):
+                    raise RuntimeError(
+                        f"planning chunk {segment_index} has a discontinuous "
+                        f"{field} boundary"
+                    )
+        for point_index, point in enumerate(trajectory.points):
+            if segment_index and point_index == 0:
+                continue
+            appended = copy.deepcopy(point)
+            set_duration(
+                appended.time_from_start,
+                elapsed + duration_seconds(point.time_from_start),
+            )
+            combined.points.append(appended)
+        elapsed += segment_duration
+        previous = combined.points[-1]
+    return combined
+
+
+def point_polyline_distance(point, polyline) -> float:
+    point = finite_point(point)
+    vertices = np.asarray(polyline, dtype=float)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 1:
+        raise ValueError("polyline must contain at least one 3-D point")
+    if len(vertices) == 1:
+        return float(np.linalg.norm(point - vertices[0]))
+    left = vertices[:-1]
+    delta = vertices[1:] - left
+    denominator = np.einsum("ij,ij->i", delta, delta)
+    numerator = np.einsum("ij,ij->i", point - left, delta)
+    fraction = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=denominator > 0.0,
+    )
+    fraction = np.clip(fraction, 0.0, 1.0)
+    projection = left + fraction[:, None] * delta
+    return float(np.min(np.linalg.norm(point - projection, axis=1)))
+
+
+def ordered_waypoint_matches(waypoints, samples):
+    """Match each waypoint to a nondecreasing sample index."""
+    waypoints = np.asarray(waypoints, dtype=float)
+    samples = np.asarray(samples, dtype=float)
+    if (
+        waypoints.ndim != 2
+        or samples.ndim != 2
+        or waypoints.shape[1:] != (3,)
+        or samples.shape[1:] != (3,)
+        or not len(waypoints)
+        or not len(samples)
+        or not np.isfinite(waypoints).all()
+        or not np.isfinite(samples).all()
+    ):
+        raise ValueError("waypoints and samples must be finite N-by-3 arrays")
+    cursor = 0
+    matches = []
+    for waypoint in waypoints:
+        distances = np.linalg.norm(samples[cursor:] - waypoint, axis=1)
+        relative_index = int(np.argmin(distances))
+        cursor += relative_index
+        matches.append({
+            "sample_index": cursor,
+            "error_m": float(distances[relative_index]),
+        })
+    return matches
+
+
+def json_number(value):
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def joint_state_sample_time(message, fallback_monotonic_s):
+    """Use the driver's acquisition stamp for derivatives, not callback time."""
+    stamp = message.header.stamp
+    timestamp = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+    if math.isfinite(timestamp) and timestamp > 0.0:
+        return timestamp
+    fallback = float(fallback_monotonic_s)
+    if not math.isfinite(fallback):
+        raise ValueError("joint-state fallback time must be finite")
+    return fallback
+
+
+def write_json_exclusive(path: Path, value):
+    with Path(path).open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+
+
+def config_hashes(root: Path):
+    names = (
+        "ur3_system.yaml",
+        "ur3_calibration.yaml",
+        "table_world_calibration.yaml",
+        "acrylic_side_boundaries.yaml",
+        "magnet_tool_geometry_draft.yaml",
+    )
+    return {
+        name: hashlib.sha256((root / "config" / name).read_bytes()).hexdigest()
+        for name in names
+    }
+
+
+class FullToolGuard(AcrylicCeilingGuard):
+    """MoveIt scene containing the table and the provisional complete tool."""
+
+    def __init__(self, node):
+        super().__init__(node)
+        root = project_root()
+        with (root / "config" / "magnet_tool_geometry_draft.yaml").open(
+            encoding="utf-8"
+        ) as stream:
+            self.tool_data = yaml.safe_load(stream)
+        envelope = self.tool_data["provisional_whole_tool_envelope"]
+        self.tool_lower = finite_point(envelope["min_xyz_m"], "tool lower bound")
+        self.tool_upper = finite_point(envelope["max_xyz_m"], "tool upper bound")
+        if np.any(self.tool_upper <= self.tool_lower):
+            raise ValueError("invalid complete-tool envelope")
+        tcp = np.asarray(self.configuration["magnet_tcp_xyz_m"], dtype=float)
+        radius = float(self.configuration["magnet_sphere_radius_m"])
+        if np.any(tcp - radius < self.tool_lower) or np.any(tcp + radius > self.tool_upper):
+            raise ValueError("complete-tool envelope does not contain the magnetic sphere")
+        self.provisional = (
+            self.tool_data.get("status") != "complete_verified"
+            or envelope.get("verified_encloses_all_rigid_parts") is not True
+            or envelope.get("cable_geometry_included") is not True
+        )
+        self.robot_description = None
+
+    def _attached_tool_envelope(self):
+        primitive = SolidPrimitive()
+        primitive.type = SolidPrimitive.BOX
+        primitive.dimensions = (self.tool_upper - self.tool_lower).tolist()
+        pose = Pose()
+        center = (self.tool_upper + self.tool_lower) / 2.0
+        pose.position.x, pose.position.y, pose.position.z = map(float, center)
+        pose.orientation.w = 1.0
+
+        collision = CollisionObject()
+        collision.header.frame_id = "tool0"
+        collision.id = TOOL_OBJECT_ID
+        collision.primitives = [primitive]
+        collision.primitive_poses = [pose]
+        collision.operation = CollisionObject.ADD
+
+        attached = AttachedCollisionObject()
+        attached.link_name = "tool0"
+        attached.object = collision
+        attached.touch_links = ["tool0", "flange", "wrist_3_link"]
+        return attached
+
+    def _forbidden_table_object(self):
+        height = 1.0
+        top = self.configuration["clearance_limits_m"]["table"]
+        return self._world_box(
+            TABLE_OBJECT_ID,
+            [0.0, 0.0, top - height / 2.0],
+            [2.0, 2.0, height],
+        )
+
+    def apply(self, robot_state):
+        parameters = GetParameters.Request()
+        parameters.names = ["robot_description"]
+        response = self.node.call(self.description_client, parameters)
+        self.robot_description = response.values[0].string_value
+        if self.configuration["kinematics_hash"] not in self.robot_description:
+            raise RuntimeError(
+                "MoveIt model is not calibrated for this UR3; use "
+                "robot/calibrated_moveit.launch.py"
+            )
+        request = ApplyPlanningScene.Request()
+        request.scene = PlanningScene()
+        request.scene.is_diff = True
+        request.scene.world.collision_objects = [
+            self._forbidden_ceiling_object(),
+            *self._forbidden_side_objects(),
+            self._forbidden_table_object(),
+        ]
+        request.scene.robot_state = copy.deepcopy(robot_state)
+        request.scene.robot_state.is_diff = True
+        request.scene.robot_state.attached_collision_objects = [
+            self._attached_tool_envelope()
+        ]
+        applied = self.node.call(self.apply_client, request, timeout=10.0)
+        if not applied.success:
+            raise RuntimeError("MoveIt rejected the complete guarded planning scene")
+
+    def decorate_state(self, robot_state):
+        guarded = copy.deepcopy(robot_state)
+        guarded.is_diff = True
+        guarded.attached_collision_objects = [self._attached_tool_envelope()]
+        return guarded
+
+
+class MagnetPathGeometry:
+    """Independent world-plane and complete-tool checks for joint states."""
+
+    def __init__(self, robot_description, guard: FullToolGuard, system):
+        if not robot_description:
+            raise ValueError("robot_description is unavailable")
+        configuration = guard.configuration
+        self.model = CeilingGeometry(
+            robot_description, configuration["T_base_from_world"]
+        )
+        self.table = configuration["table_geometry"]
+        with (project_root() / "config" / "acrylic_side_boundaries.yaml").open(
+            encoding="utf-8"
+        ) as stream:
+            self.sides = yaml.safe_load(stream)
+        self.offset = np.asarray(configuration["magnet_tcp_xyz_m"], dtype=float)
+        self.motor_axis_tool = normalized_vector(
+            configuration["motor_axis_tool_vector"],
+            "motor axis in tool",
+        )
+        self.radius = float(configuration["magnet_sphere_radius_m"])
+        self.tool_corners = np.asarray(
+            [[x, y, z]
+             for x in (guard.tool_lower[0], guard.tool_upper[0])
+             for y in (guard.tool_lower[1], guard.tool_upper[1])
+             for z in (guard.tool_lower[2], guard.tool_upper[2])],
+            dtype=float,
+        )
+        self.limits = load_clearance_limits_m(project_root())
+        workspace = system["safety"]["workspace_bounds_m"]
+        self.workspace_lower = np.asarray(
+            [workspace[key][0] for key in ("x", "y", "z")], dtype=float
+        )
+        self.workspace_upper = np.asarray(
+            [workspace[key][1] for key in ("x", "y", "z")], dtype=float
+        )
+        if (not np.isfinite([self.workspace_lower, self.workspace_upper]).all()
+                or np.any(self.workspace_upper <= self.workspace_lower)):
+            raise ValueError("invalid base-frame workspace bounds")
+        self.workspace_ingress_limit = np.zeros(6, dtype=float)
+        self.reference_rotation_world = None
+
+    def workspace_violation(self, point):
+        point = finite_point(point, "workspace point")
+        return np.r_[
+            np.maximum(self.workspace_lower - point, 0.0),
+            np.maximum(point - self.workspace_upper, 0.0),
+        ]
+
+    def configure_workspace_ingress(self, start_magnet_base, allowed):
+        violation = self.workspace_violation(start_magnet_base)
+        if np.any(violation > 0.0) and not allowed:
+            raise RuntimeError(
+                "current magnet centre is outside the configured workspace; "
+                "a reviewed ingress path requires --allow-workspace-ingress"
+            )
+        self.workspace_ingress_limit = violation if allowed else np.zeros(6)
+        return violation
+
+    def inspect(self, names, positions, allow_workspace_ingress=False):
+        positions = np.asarray(positions, dtype=float)
+        if len(names) != len(positions) or not np.isfinite(positions).all():
+            raise RuntimeError("invalid joint state for geometry inspection")
+        joints = dict(zip(names, positions))
+        if any(name not in joints for name in JOINT_NAMES):
+            raise RuntimeError("joint state does not contain the six UR joints")
+        transforms = self.model.transforms(joints)
+        tool_base = transforms["tool0"]
+        tool_world = self.model.world_from_base @ tool_base
+        rotation_world_tool = tool_world[:3, :3]
+        magnet_base = tool_base[:3, 3] + tool_base[:3, :3] @ self.offset
+        magnet_world = tool_world[:3, 3] + rotation_world_tool @ self.offset
+        motor_axis_world = normalized_vector(
+            rotation_world_tool @ self.motor_axis_tool,
+            "motor axis in world",
+        )
+        quaternion_world_tool = Rotation.from_matrix(
+            rotation_world_tool
+        ).as_quat()
+
+        workspace_violation = self.workspace_violation(magnet_base)
+        workspace_outside = bool(np.any(workspace_violation > 1.0e-9))
+        ingress_is_bounded = (
+            allow_workspace_ingress
+            and np.all(
+                workspace_violation
+                <= self.workspace_ingress_limit
+                + WORKSPACE_INGRESS_TOLERANCE_M
+            )
+        )
+        if workspace_outside and not ingress_is_bounded:
+            raise RuntimeError(
+                "magnet centre left configured base-frame workspace: "
+                f"{(magnet_base * 1000.0).round(3).tolist()} mm"
+            )
+
+        bounds = self.model.bounds(joints, self.offset, self.radius)
+        tool_points = (
+            self.tool_corners @ tool_world[:3, :3].T + tool_world[:3, 3]
+        )
+        bounds[TOOL_OBJECT_ID] = (tool_points.min(axis=0), tool_points.max(axis=0))
+        minima = {name: (math.inf, None) for name in self.limits}
+        for geometry_name, (lower, upper) in bounds.items():
+            gaps = modeled_boundary_gaps_m(self.table, self.sides, lower, upper)
+            for boundary, gap in gaps.items():
+                if gap < minima[boundary][0]:
+                    minima[boundary] = (float(gap), geometry_name)
+
+        for boundary, (gap, geometry_name) in minima.items():
+            required = self.limits[boundary] + STOPPING_RESERVE_M
+            if gap + 1.0e-9 < required:
+                raise RuntimeError(
+                    f"{boundary} clearance failed at {geometry_name}: "
+                    f"gap={gap * 1000.0:.3f} mm, "
+                    f"required={required * 1000.0:.3f} mm "
+                    "(global policy plus 2 mm execution reserve)"
+                )
+
+        orientation_change = 0.0
+        if self.reference_rotation_world is not None:
+            orientation_change = float(
+                (Rotation.from_matrix(self.reference_rotation_world).inv()
+                 * Rotation.from_matrix(rotation_world_tool)).magnitude()
+            )
+            if orientation_change > math.radians(0.25):
+                raise RuntimeError(
+                    "fixed tool orientation departed by more than 0.25 degrees"
+                )
+
+        return {
+            "magnet_world_mm": (magnet_world * 1000.0).tolist(),
+            "magnet_base_mm": (magnet_base * 1000.0).tolist(),
+            "tool_quaternion_world_xyzw": quaternion_world_tool.tolist(),
+            "motor_axis_world": motor_axis_world.tolist(),
+            "workspace_outside": workspace_outside,
+            "workspace_violation_mm": (workspace_violation * 1000.0).tolist(),
+            "gaps_mm": {
+                key: json_number(value[0] * 1000.0) for key, value in minima.items()
+            },
+            "limiting_geometry": {key: value[1] for key, value in minima.items()},
+            "orientation_change_deg": math.degrees(orientation_change),
+        }
+
+
+def scale_joint_trajectory(trajectory, factor):
+    factor = float(factor)
+    if not math.isfinite(factor) or factor <= 0.0:
+        raise ValueError("trajectory time scale must be finite and positive")
+    for point in trajectory.points:
+        set_duration(
+            point.time_from_start,
+            duration_seconds(point.time_from_start) * factor,
+        )
+        if point.velocities:
+            point.velocities = [value / factor for value in point.velocities]
+        if point.accelerations:
+            point.accelerations = [value / (factor * factor)
+                                   for value in point.accelerations]
+
+
+def maximum_trajectory_acceleration(trajectory):
+    maximum = 0.0
+    for point in trajectory.points:
+        if point.accelerations:
+            maximum = max(
+                maximum,
+                float(np.max(np.abs(point.accelerations))),
+            )
+    return maximum
+
+
+def build_trajectory_trace(
+    trajectory,
+    geometry: MagnetPathGeometry,
+    allow_workspace_ingress=False,
+):
+    trace = []
+    previous_time = None
+    previous_q = None
+    previous_magnet = None
+    previous_rotation = None
+    maximum_joint_speed = 0.0
+    maximum_magnet_speed = 0.0
+    maximum_tool_angular_speed = 0.0
+    workspace_entered = False
+    previous_workspace_violation = None
+    for timestamp, positions in sample_trajectory(trajectory, TRACE_INTERVAL_S):
+        checked = geometry.inspect(
+            trajectory.joint_names,
+            positions,
+            allow_workspace_ingress=allow_workspace_ingress,
+        )
+        if checked["workspace_outside"]:
+            if workspace_entered:
+                raise RuntimeError(
+                    "planned trajectory left the workspace after entering it"
+                )
+            violation = np.asarray(
+                checked["workspace_violation_mm"], dtype=float
+            )
+            if (
+                previous_workspace_violation is not None
+                and np.any(
+                    violation
+                    > previous_workspace_violation
+                    + WORKSPACE_INGRESS_TOLERANCE_M * 1000.0
+                )
+            ):
+                raise RuntimeError(
+                    "planned workspace-ingress violation is not monotonic"
+                )
+            previous_workspace_violation = violation
+        else:
+            workspace_entered = True
+        magnet = np.asarray(checked["magnet_world_mm"], dtype=float) / 1000.0
+        rotation = Rotation.from_quat(
+            checked["tool_quaternion_world_xyzw"]
+        )
+        joint_speed = magnet_speed = tool_angular_speed = 0.0
+        if previous_time is not None:
+            elapsed = timestamp - previous_time
+            if elapsed <= 0.0:
+                raise RuntimeError("trajectory sampling produced non-increasing time")
+            joint_speed = float(np.max(np.abs(positions - previous_q)) / elapsed)
+            magnet_speed = float(np.linalg.norm(magnet - previous_magnet) / elapsed)
+            tool_angular_speed = float(
+                (previous_rotation.inv() * rotation).magnitude() / elapsed
+            )
+            maximum_joint_speed = max(maximum_joint_speed, joint_speed)
+            maximum_magnet_speed = max(maximum_magnet_speed, magnet_speed)
+            maximum_tool_angular_speed = max(
+                maximum_tool_angular_speed, tool_angular_speed
+            )
+        trace.append({
+            "time_s": float(timestamp),
+            "q_rad": positions.tolist(),
+            **checked,
+            "joint_speed_deg_s": math.degrees(joint_speed),
+            "magnet_speed_mm_s": magnet_speed * 1000.0,
+            "tool_angular_speed_deg_s": math.degrees(tool_angular_speed),
+        })
+        previous_time = timestamp
+        previous_q = positions
+        previous_magnet = magnet
+        previous_rotation = rotation
+    if not workspace_entered:
+        raise RuntimeError("planned trajectory never enters the configured workspace")
+    return (
+        trace,
+        maximum_joint_speed,
+        maximum_magnet_speed,
+        maximum_tool_angular_speed,
+    )
+
+
+class VectorVelocityWindow:
+    def __init__(self, window_s=0.08):
+        self.window_s = float(window_s)
+        self.samples = deque()
+
+    def add(self, timestamp, value):
+        timestamp = float(timestamp)
+        value = np.asarray(value, dtype=float)
+        if self.samples and timestamp <= self.samples[-1][0]:
+            return
+        self.samples.append((timestamp, value.copy()))
+        while self.samples and timestamp - self.samples[0][0] > 0.25:
+            self.samples.popleft()
+
+    def velocity(self):
+        if len(self.samples) < 2:
+            return None
+        end_time, end = self.samples[-1]
+        for start_time, start in reversed(list(self.samples)[:-1]):
+            elapsed = end_time - start_time
+            if elapsed >= self.window_s:
+                return (end - start) / elapsed
+        return None
+
+
+class AngularVelocityWindow:
+    def __init__(self, window_s=0.08):
+        self.window_s = float(window_s)
+        self.samples = deque()
+
+    def add(self, timestamp, quaternion):
+        timestamp = float(timestamp)
+        rotation = Rotation.from_quat(np.asarray(quaternion, dtype=float))
+        if self.samples and timestamp <= self.samples[-1][0]:
+            return
+        self.samples.append((timestamp, rotation))
+        while self.samples and timestamp - self.samples[0][0] > 0.25:
+            self.samples.popleft()
+
+    def speed(self):
+        if len(self.samples) < 2:
+            return None
+        end_time, end = self.samples[-1]
+        for start_time, start in reversed(list(self.samples)[:-1]):
+            elapsed = end_time - start_time
+            if elapsed >= self.window_s:
+                return float((start.inv() * end).magnitude() / elapsed)
+        return None
+
+
+class MagnetTrajectoryNode(CartesianLineMove):
+    def __init__(self):
+        super().__init__(
+            node_name="magnet_trajectory",
+            guard_factory=FullToolGuard,
+        )
+        root = project_root()
+        with (root / "config" / "ur3_system.yaml").open(encoding="utf-8") as stream:
+            self.system = yaml.safe_load(stream)
+        self.geometry = None
+        self.planned_polyline = None
+        self.planned_pose_centres = None
+        self.planned_pose_quaternions = None
+        self.target_motor_axis_world = None
+        self.actual_stream = None
+        self.actual_samples = []
+        self.last_logged_state_time = None
+        self.joint_velocity_window = VectorVelocityWindow()
+        self.magnet_velocity_window = VectorVelocityWindow()
+        self.tool_angular_velocity_window = AngularVelocityWindow()
+        self.allow_workspace_ingress = False
+        self.live_workspace_entered = False
+        self.live_workspace_violation_mm = None
+        self.maximum_live_tcp_speed = float(
+            self.system["safety"]["initial_max_tcp_speed_m_s"]
+        )
+        if not 0.0 < self.maximum_live_tcp_speed <= 0.020:
+            raise ValueError("configured initial TCP speed limit must be in (0, 20] mm/s")
+
+    def wait_for_fresh_state(self, timeout=5.0, require_execution_state=False):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            state_is_fresh = (
+                self.joint_state_received_at is not None
+                and time.monotonic() - self.joint_state_received_at <= 0.2
+            )
+            execution_state_is_ready = (
+                not require_execution_state
+                or (
+                    self.robot_program_running is not None
+                    and self.speed_scaling_percent is not None
+                )
+            )
+            if state_is_fresh and execution_state_is_ready:
+                return
+        raise RuntimeError("timed out waiting for fresh robot state")
+
+    def validate_controller_interpolation(self, trajectory, start_state):
+        """Collision-check interior points of every controller spline segment."""
+        names = list(trajectory.joint_names)
+        state_indices = {
+            name: index for index, name in enumerate(start_state.joint_state.name)
+        }
+        if any(name not in state_indices for name in names):
+            raise RuntimeError("controller trajectory contains an unknown joint")
+        sample_count = 0
+        for segment_index, (left, right) in enumerate(
+            zip(trajectory.points, trajectory.points[1:])
+        ):
+            duration = (
+                duration_seconds(right.time_from_start)
+                - duration_seconds(left.time_from_start)
+            )
+            if duration <= 0.0:
+                raise RuntimeError("controller trajectory times are not increasing")
+            segment = JointTrajectory()
+            segment.joint_names = names
+            segment.points = [left, right]
+            samples = list(
+                sample_trajectory(
+                    segment,
+                    interval_s=duration / COLLISION_SUBDIVISIONS_PER_SEGMENT,
+                )
+            )
+            for _, positions in samples[1:-1]:
+                state = copy.deepcopy(start_state)
+                values = list(state.joint_state.position)
+                for name, value in zip(names, positions):
+                    values[state_indices[name]] = float(value)
+                state.joint_state.position = values
+                state.joint_state.velocity = []
+                state.joint_state.effort = []
+                self.ceiling_guard.validate_state(
+                    state,
+                    f"controller spline {segment_index} interior {sample_count}",
+                )
+                sample_count += 1
+        return sample_count
+
+    def current_tool_pose(self, start_state):
+        request = GetPositionFK.Request()
+        request.header.frame_id = "base"
+        request.fk_link_names = ["tool0"]
+        request.robot_state = start_state
+        response = self.call(self.fk_client, request)
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f"FK failed, code={response.error_code.val}")
+        return response.pose_stamped[0].pose
+
+    def plan_magnet_targets(
+        self,
+        targets_world,
+        speed_m_s,
+        allow_workspace_ingress=False,
+        planning_chunk_m=None,
+        motor_axis_parallel=None,
+        motor_axis_direction="nearest",
+        motor_axis_roll_deg=0.0,
+        axis_alignment_phase="after",
+    ):
+        speed_m_s = float(speed_m_s)
+        if not math.isfinite(speed_m_s) or not 0.0001 <= speed_m_s <= 0.020:
+            raise ValueError("magnet speed must be within [0.1, 20] mm/s")
+        if motor_axis_parallel is not None and motor_axis_parallel not in (
+            "x", "y", "z"
+        ):
+            raise ValueError("motor-axis parallel target must be x, y, or z")
+        if motor_axis_direction not in ("nearest", "positive", "negative"):
+            raise ValueError(
+                "motor-axis direction must be nearest, positive, or negative"
+            )
+        if motor_axis_parallel is None and motor_axis_direction != "nearest":
+            raise ValueError(
+                "motor-axis direction requires --motor-axis-parallel"
+            )
+        if axis_alignment_phase not in ("before", "after"):
+            raise ValueError("axis alignment phase must be before or after")
+        targets_world = [
+            finite_point(point, f"target {index}")
+            for index, point in enumerate(targets_world)
+        ]
+        self.maximum_live_tcp_speed = min(
+            float(self.system["safety"]["initial_max_tcp_speed_m_s"]),
+            max(speed_m_s * 1.10, speed_m_s + 0.0005),
+        )
+        self.allow_workspace_ingress = bool(allow_workspace_ingress)
+        start_state = self.current_robot_state()
+        self.ceiling_guard.apply(start_state)
+        self.ceiling_guard.validate_state(start_state, "current robot state")
+        start_pose = self.current_tool_pose(start_state)
+        rotation_base_tool = quaternion_matrix(start_pose)
+        offset = np.asarray(
+            self.ceiling_guard.configuration["magnet_tcp_xyz_m"], dtype=float
+        )
+        start_tool_base = np.asarray(
+            [start_pose.position.x, start_pose.position.y, start_pose.position.z]
+        )
+        start_magnet_base = start_tool_base + rotation_base_tool @ offset
+        base_from_world = np.asarray(
+            self.ceiling_guard.configuration["T_base_from_world"], dtype=float
+        )
+        world_from_base = np.linalg.inv(base_from_world)
+        start_magnet_world = homogeneous_point(world_from_base, start_magnet_base)
+        start_rotation_world = world_from_base[:3, :3] @ rotation_base_tool
+        route, segment_lengths, total_length = validate_route(
+            start_magnet_world, targets_world
+        )
+
+        axis_alignment = None
+        target_rotation_world = None
+        if motor_axis_parallel is not None:
+            if not self.ceiling_guard.configuration["motor_axis_verified"]:
+                raise RuntimeError(
+                    "motor-axis alignment is blocked because the physical "
+                    "shaft direction has not been verified"
+                )
+            axis_alignment = parallel_axis_target_rotation(
+                start_rotation_world,
+                self.ceiling_guard.configuration["motor_axis_tool_vector"],
+                motor_axis_parallel,
+                motor_axis_direction,
+                motor_axis_roll_deg,
+            )
+            target_rotation_world = axis_alignment["rotation_world_tool"]
+            self.target_motor_axis_world = axis_alignment[
+                "target_axis_world"
+            ].copy()
+        else:
+            self.target_motor_axis_world = None
+
+        workspace = self.system["safety"]["workspace_bounds_m"]
+        workspace_lower = np.asarray(
+            [workspace[key][0] for key in ("x", "y", "z")], dtype=float
+        )
+        workspace_upper = np.asarray(
+            [workspace[key][1] for key in ("x", "y", "z")], dtype=float
+        )
+        start_target_violation = np.r_[
+            np.maximum(workspace_lower - start_magnet_base, 0.0),
+            np.maximum(start_magnet_base - workspace_upper, 0.0),
+        ]
+        previous_target_violation = start_target_violation
+        target_path_entered_workspace = not np.any(
+            start_target_violation > 1.0e-9
+        )
+        for index, magnet_world in enumerate(targets_world):
+            magnet_base = homogeneous_point(base_from_world, magnet_world)
+            target_violation = np.r_[
+                np.maximum(workspace_lower - magnet_base, 0.0),
+                np.maximum(magnet_base - workspace_upper, 0.0),
+            ]
+            target_is_outside = bool(np.any(target_violation > 1.0e-9))
+            if target_is_outside:
+                bounded_ingress_target = (
+                    allow_workspace_ingress
+                    and not target_path_entered_workspace
+                    and np.all(
+                        target_violation
+                        <= start_target_violation
+                        + WORKSPACE_INGRESS_TOLERANCE_M
+                    )
+                    and np.all(
+                        target_violation
+                        <= previous_target_violation
+                        + WORKSPACE_INGRESS_TOLERANCE_M
+                    )
+                )
+                if not bounded_ingress_target:
+                    raise RuntimeError(
+                        f"target {index} is outside the configured base-frame "
+                        f"workspace: {(magnet_base * 1000.0).round(3).tolist()} mm"
+                    )
+            else:
+                target_path_entered_workspace = True
+            previous_target_violation = target_violation
+
+        def pose_from_step(step):
+            magnet_world = step["magnet_world"]
+            rotation_world = step["rotation_world_tool"]
+            magnet_base = homogeneous_point(base_from_world, magnet_world)
+            rotation_base = base_from_world[:3, :3] @ rotation_world
+            tool_base = magnet_base - rotation_base @ offset
+            pose = copy.deepcopy(start_pose)
+            if not np.isfinite(tool_base).all():
+                raise RuntimeError("a target produced a non-finite tool pose")
+            pose.position.x, pose.position.y, pose.position.z = map(float, tool_base)
+            quaternion = Rotation.from_matrix(rotation_base).as_quat()
+            (
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ) = map(float, quaternion)
+            return pose
+
+        translation_centres = (
+            targets_world
+            if planning_chunk_m is None
+            else subdivide_route(route, planning_chunk_m)
+        )
+        translation_rotation = (
+            target_rotation_world
+            if target_rotation_world is not None
+            and axis_alignment_phase == "before"
+            else start_rotation_world
+        )
+        translation_steps = [
+            {
+                "phase": "translation",
+                "magnet_world": centre,
+                "rotation_world_tool": translation_rotation,
+            }
+            for centre in translation_centres
+        ]
+        orientation_steps = []
+        if target_rotation_world is not None and axis_alignment[
+            "rotation_angle_rad"
+        ] > 1.0e-8:
+            rotation_centre = (
+                route[0] if axis_alignment_phase == "before" else route[-1]
+            )
+            orientation_steps = [
+                {
+                    "phase": "axis_alignment",
+                    "magnet_world": rotation_centre,
+                    "rotation_world_tool": rotation,
+                }
+                for rotation in interpolate_rotations(
+                    start_rotation_world,
+                    target_rotation_world,
+                    ORIENTATION_WAYPOINT_STEP_RAD,
+                )[1:]
+            ]
+        ordered_steps = (
+            [*orientation_steps, *translation_steps]
+            if axis_alignment_phase == "before"
+            else [*translation_steps, *orientation_steps]
+        )
+        if not ordered_steps:
+            raise RuntimeError("requested pose path contains no motion targets")
+
+        def request_cartesian(segment_state, waypoint_poses):
+            # Short segmented paths deliberately stop at each boundary.  Ask
+            # MoveIt for a reasonably conditioned time parameterization, then
+            # uniformly slow the joined trajectory below the application-level
+            # magnet and joint speed limits before any execution is possible.
+            parameterization_scale = 0.25 if planning_chunk_m is not None else 0.05
+            request = GetCartesianPath.Request()
+            request.header.frame_id = "base"
+            request.start_state = self.ceiling_guard.decorate_state(segment_state)
+            request.group_name = "ur_manipulator"
+            request.link_name = "tool0"
+            request.waypoints = waypoint_poses
+            request.max_step = MAX_CARTESIAN_STEP_M
+            request.jump_threshold = 2.0
+            request.prismatic_jump_threshold = 0.0
+            request.revolute_jump_threshold = 0.10
+            request.avoid_collisions = True
+            request.max_velocity_scaling_factor = parameterization_scale
+            request.max_acceleration_scaling_factor = parameterization_scale
+            return self.call(self.cartesian_client, request, timeout=60.0)
+
+        if planning_chunk_m is None:
+            planning_groups = [("combined", ordered_steps)]
+        else:
+            planning_groups = []
+            if axis_alignment_phase == "before" and orientation_steps:
+                planning_groups.append(("axis_alignment", orientation_steps))
+            planning_groups.extend(
+                ("translation", [step]) for step in translation_steps
+            )
+            if axis_alignment_phase == "after" and orientation_steps:
+                planning_groups.append(("axis_alignment", orientation_steps))
+
+        planning_chunks = []
+        segment_state = copy.deepcopy(start_state)
+        segment_trajectories = []
+        fractions = []
+        single_response = None
+        for chunk_index, (phase, steps) in enumerate(planning_groups):
+            waypoint_poses = [pose_from_step(step) for step in steps]
+            response = request_cartesian(segment_state, waypoint_poses)
+            single_response = response
+            fraction_value = float(response.fraction)
+            fractions.append(fraction_value)
+            endpoint = steps[-1]
+            if planning_chunk_m is not None:
+                endpoint_axis = (
+                    endpoint["rotation_world_tool"]
+                    @ normalized_vector(
+                        self.ceiling_guard.configuration[
+                            "motor_axis_tool_vector"
+                        ],
+                        "motor axis in tool",
+                    )
+                )
+                planning_chunks.append({
+                    "index": chunk_index,
+                    "phase": phase,
+                    "waypoint_count": len(steps),
+                    "target_world_mm": (
+                        endpoint["magnet_world"] * 1000.0
+                    ).tolist(),
+                    "target_motor_axis_world": endpoint_axis.tolist(),
+                    "fraction": fraction_value,
+                    "trajectory_points": len(
+                        response.solution.joint_trajectory.points
+                    ),
+                })
+            label = (
+                "Cartesian planning"
+                if planning_chunk_m is None
+                else f"Cartesian planning chunk {chunk_index} ({phase})"
+            )
+            if response.error_code.val != MoveItErrorCodes.SUCCESS:
+                raise RuntimeError(
+                    f"{label} failed, code={response.error_code.val}"
+                )
+            if fraction_value < 0.999999:
+                raise RuntimeError(
+                    f"{label} incomplete: {fraction_value * 100.0:.3f}%"
+                )
+            segment = response.solution.joint_trajectory
+            if len(segment.points) < 2:
+                raise RuntimeError(f"{label} returned too few trajectory points")
+            self.unwrap_and_check_joint_limits(segment, segment_state)
+            self.validate_trajectory_states(segment, segment_state)
+            segment_trajectories.append(segment)
+            segment_state = robot_state_after_trajectory(segment_state, segment)
+
+        if planning_chunk_m is None:
+            solution = single_response.solution
+        else:
+            solution = RobotTrajectory()
+            solution.joint_trajectory = concatenate_joint_trajectories(
+                segment_trajectories
+            )
+        trajectory = solution.joint_trajectory
+        fraction = min(fractions)
+
+        self.geometry = MagnetPathGeometry(
+            self.ceiling_guard.robot_description,
+            self.ceiling_guard,
+            self.system,
+        )
+        start_workspace_violation = self.geometry.configure_workspace_ingress(
+            start_magnet_base,
+            self.allow_workspace_ingress,
+        )
+        self.geometry.reference_rotation_world = (
+            start_rotation_world if target_rotation_world is None else None
+        )
+        start_checked = self.geometry.inspect(
+            start_state.joint_state.name,
+            start_state.joint_state.position,
+            allow_workspace_ingress=self.allow_workspace_ingress,
+        )
+        self.live_workspace_entered = not start_checked["workspace_outside"]
+        self.live_workspace_violation_mm = np.asarray(
+            start_checked["workspace_violation_mm"], dtype=float
+        )
+
+        original_duration = duration_seconds(trajectory.points[-1].time_from_start)
+        if original_duration <= 0.0:
+            raise RuntimeError("Cartesian trajectory has no time parameterization")
+        orientation_angle = (
+            0.0
+            if axis_alignment is None
+            else axis_alignment["rotation_angle_rad"]
+        )
+        requested_duration = (
+            total_length / speed_m_s
+            + orientation_angle / PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
+        )
+        duration_limit_s = (
+            MAX_SEGMENTED_DURATION_S
+            if planning_chunk_m is not None
+            else MAX_DURATION_S
+        )
+        minimum_time_scale = 0.5 if planning_chunk_m is not None else 1.0
+        initial_time_scale = max(
+            minimum_time_scale,
+            requested_duration / original_duration,
+        )
+        scale_joint_trajectory(trajectory, initial_time_scale)
+        scaled_duration = duration_seconds(trajectory.points[-1].time_from_start)
+        if scaled_duration > duration_limit_s:
+            raise RuntimeError(
+                "initially scaled planned duration "
+                f"{scaled_duration:.1f}s exceeds {duration_limit_s:.0f}s "
+                f"(original={original_duration:.1f}s, "
+                f"requested={requested_duration:.1f}s, "
+                f"scale={initial_time_scale:.3f})"
+            )
+        (
+            trace,
+            maximum_joint_speed,
+            maximum_magnet_speed,
+            maximum_tool_angular_speed,
+        ) = build_trajectory_trace(
+            trajectory,
+            self.geometry,
+            allow_workspace_ingress=self.allow_workspace_ingress,
+        )
+        additional_scale = max(
+            1.0,
+            maximum_joint_speed / PLANNED_JOINT_SPEED_LIMIT_RAD_S,
+            maximum_magnet_speed / speed_m_s,
+            maximum_tool_angular_speed
+            / PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S,
+        )
+        if additional_scale > 1.000001:
+            # Leave a small numerical margin because the trace is rebuilt by
+            # interpolation after the timestamps and derivatives are scaled.
+            additional_scale *= 1.001
+            duration_before_speed_limits = scaled_duration
+            joint_speed_before_limits = maximum_joint_speed
+            magnet_speed_before_limits = maximum_magnet_speed
+            angular_speed_before_limits = maximum_tool_angular_speed
+            scale_joint_trajectory(trajectory, additional_scale)
+            scaled_duration = duration_seconds(
+                trajectory.points[-1].time_from_start
+            )
+            if scaled_duration > duration_limit_s:
+                raise RuntimeError(
+                    "speed-limited planned duration "
+                    f"{scaled_duration:.1f}s exceeds {duration_limit_s:.0f}s "
+                    f"(before={duration_before_speed_limits:.1f}s, "
+                    f"joint_peak={math.degrees(joint_speed_before_limits):.3f}deg/s, "
+                    f"magnet_peak={magnet_speed_before_limits * 1000.0:.3f}mm/s, "
+                    f"tool_angular_peak={math.degrees(angular_speed_before_limits):.3f}deg/s, "
+                    f"scale={additional_scale:.3f})"
+                )
+            (
+                trace,
+                maximum_joint_speed,
+                maximum_magnet_speed,
+                maximum_tool_angular_speed,
+            ) = build_trajectory_trace(
+                trajectory,
+                self.geometry,
+                allow_workspace_ingress=self.allow_workspace_ingress,
+            )
+        if maximum_joint_speed > PLANNED_JOINT_SPEED_LIMIT_RAD_S + 1.0e-9:
+            raise RuntimeError(
+                "planned joint speed remains above the application limit: "
+                f"{math.degrees(maximum_joint_speed):.6f} deg/s > "
+                f"{math.degrees(PLANNED_JOINT_SPEED_LIMIT_RAD_S):.6f} deg/s"
+            )
+        if maximum_magnet_speed > speed_m_s + 1.0e-9:
+            raise RuntimeError(
+                "planned magnet speed remains above the requested limit: "
+                f"{maximum_magnet_speed * 1000.0:.6f} mm/s > "
+                f"{speed_m_s * 1000.0:.6f} mm/s"
+            )
+        if (
+            maximum_tool_angular_speed
+            > PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S + 1.0e-9
+        ):
+            raise RuntimeError(
+                "planned tool angular speed remains above the application "
+                f"limit: {math.degrees(maximum_tool_angular_speed):.6f} deg/s > "
+                f"{math.degrees(PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S):.6f} deg/s"
+            )
+        final_duration = duration_seconds(trajectory.points[-1].time_from_start)
+        if final_duration > duration_limit_s:
+            raise RuntimeError(
+                f"planned duration {final_duration:.1f}s exceeds "
+                f"{duration_limit_s:.0f}s"
+            )
+        maximum_joint_acceleration = maximum_trajectory_acceleration(trajectory)
+        if (
+            maximum_joint_acceleration
+            > PLANNED_JOINT_ACCELERATION_LIMIT_RAD_S2 + 1.0e-6
+        ):
+            raise RuntimeError(
+                "planned joint acceleration exceeds MoveIt limit: "
+                f"{maximum_joint_acceleration:.3f} rad/s^2 > "
+                f"{PLANNED_JOINT_ACCELERATION_LIMIT_RAD_S2:.3f} rad/s^2"
+            )
+        final_world = np.asarray(trace[-1]["magnet_world_mm"]) / 1000.0
+        final_error = float(np.linalg.norm(final_world - targets_world[-1]))
+        if final_error > 0.00025:
+            raise RuntimeError(
+                f"planned final magnet error is {final_error * 1000.0:.3f} mm"
+            )
+        planned_polyline = np.asarray(
+            [entry["magnet_world_mm"] for entry in trace], dtype=float
+        ) / 1000.0
+        intended_polyline = np.asarray(route, dtype=float)
+        maximum_path_error = max(
+            point_polyline_distance(point, intended_polyline)
+            for point in planned_polyline
+        )
+        ordered_matches = ordered_waypoint_matches(
+            intended_polyline, planned_polyline
+        )
+        maximum_waypoint_miss = max(
+            match["error_m"] for match in ordered_matches
+        )
+        if max(maximum_path_error, maximum_waypoint_miss) > PLANNED_PATH_TOLERANCE_M:
+            raise RuntimeError(
+                "time-parameterized magnet path does not follow the requested "
+                f"polyline within {PLANNED_PATH_TOLERANCE_M * 1000.0:.2f} mm: "
+                f"path error={maximum_path_error * 1000.0:.3f} mm, "
+                f"waypoint miss={maximum_waypoint_miss * 1000.0:.3f} mm"
+            )
+        pose_centres, pose_quaternions = sample_pose_guard_path(
+            route,
+            start_rotation_world,
+            target_rotation_world,
+            axis_alignment_phase,
+        )
+        orientation_path_errors = [
+            orientation_path_distance(
+                np.asarray(entry["magnet_world_mm"], dtype=float) / 1000.0,
+                entry["tool_quaternion_world_xyzw"],
+                pose_centres,
+                pose_quaternions,
+                PLANNED_PATH_TOLERANCE_M + POSE_GUARD_POSITION_STEP_M,
+            )
+            for entry in trace
+        ]
+        maximum_orientation_path_error = max(orientation_path_errors)
+        if (
+            maximum_orientation_path_error
+            > PLANNED_ORIENTATION_PATH_TOLERANCE_RAD
+        ):
+            raise RuntimeError(
+                "time-parameterized tool orientation departed the requested "
+                "pose path: "
+                f"{math.degrees(maximum_orientation_path_error):.3f} deg > "
+                f"{math.degrees(PLANNED_ORIENTATION_PATH_TOLERANCE_RAD):.3f} deg"
+            )
+
+        final_motor_axis = normalized_vector(
+            trace[-1]["motor_axis_world"], "planned final motor axis"
+        )
+        final_axis_error = None
+        alignment_report = None
+        if axis_alignment is not None:
+            target_motor_axis = axis_alignment["target_axis_world"]
+            final_axis_error = math.acos(float(np.clip(
+                np.dot(final_motor_axis, target_motor_axis), -1.0, 1.0
+            )))
+            if final_axis_error > FINAL_AXIS_TOLERANCE_RAD:
+                raise RuntimeError(
+                    "planned final motor-axis error is "
+                    f"{math.degrees(final_axis_error):.3f} deg"
+                )
+            alignment_report = {
+                "world_axis": motor_axis_parallel,
+                "requested_direction": motor_axis_direction,
+                "selected_direction": axis_alignment["selected_direction"],
+                "roll_about_target_axis_deg": axis_alignment["roll_deg"],
+                "phase": axis_alignment_phase,
+                "current_axis_world": axis_alignment[
+                    "current_axis_world"
+                ].tolist(),
+                "target_axis_world": target_motor_axis.tolist(),
+                "minimum_rotation_deg": math.degrees(
+                    axis_alignment["rotation_angle_rad"]
+                ),
+                "orientation_waypoint_count": len(orientation_steps),
+                "planned_final_axis_world": final_motor_axis.tolist(),
+                "planned_final_axis_error_deg": math.degrees(final_axis_error),
+            }
+        # Live tracking uses the compact requested route, which was just
+        # proven equivalent to the dense planned trace within the tighter
+        # PLANNED_PATH_TOLERANCE_M.  Scanning the dense time trace in every
+        # joint-state callback can starve ROS feedback processing.
+        self.planned_polyline = intended_polyline.copy()
+        self.planned_pose_centres = pose_centres
+        self.planned_pose_quaternions = pose_quaternions
+        collision_samples = self.validate_controller_interpolation(
+            trajectory, start_state
+        )
+        minimum_planned_clearance = {
+            boundary: min(entry["gaps_mm"][boundary] for entry in trace)
+            for boundary in ("ceiling", "left", "right", "table")
+        }
+        return {
+            "solution": solution,
+            "start_state": start_state,
+            "start_magnet_world_m": start_magnet_world.tolist(),
+            "targets_world_m": [point.tolist() for point in targets_world],
+            "route_world_m": [point.tolist() for point in route],
+            "segment_lengths_m": segment_lengths,
+            "total_length_m": total_length,
+            "fraction": fraction,
+            "planning_chunk_mm": (
+                None if planning_chunk_m is None else planning_chunk_m * 1000.0
+            ),
+            "planning_chunks": planning_chunks,
+            "duration_s": final_duration,
+            "duration_limit_s": duration_limit_s,
+            "requested_translation_duration_s": total_length / speed_m_s,
+            "requested_orientation_duration_s": (
+                orientation_angle / PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
+            ),
+            "initial_time_scale": initial_time_scale,
+            "maximum_planned_joint_speed_deg_s": math.degrees(maximum_joint_speed),
+            "maximum_planned_joint_acceleration_rad_s2": maximum_joint_acceleration,
+            "maximum_planned_magnet_speed_mm_s": maximum_magnet_speed * 1000.0,
+            "maximum_planned_tool_angular_speed_deg_s": math.degrees(
+                maximum_tool_angular_speed
+            ),
+            "motor_axis_alignment": alignment_report,
+            "planned_trace": trace,
+            "maximum_requested_path_error_mm": maximum_path_error * 1000.0,
+            "maximum_requested_waypoint_miss_mm": maximum_waypoint_miss * 1000.0,
+            "maximum_orientation_path_error_deg": math.degrees(
+                maximum_orientation_path_error
+            ),
+            "ordered_waypoint_sample_indices": [
+                match["sample_index"] for match in ordered_matches
+            ],
+            "controller_interpolation_collision_samples": collision_samples,
+            "live_magnet_speed_abort_mm_s": self.maximum_live_tcp_speed * 1000.0,
+            "live_tool_angular_speed_abort_deg_s": math.degrees(
+                MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
+            ),
+            "minimum_planned_clearance_mm": minimum_planned_clearance,
+            "workspace_ingress_enabled": self.allow_workspace_ingress,
+            "start_workspace_violation_mm": (
+                start_workspace_violation * 1000.0
+            ).tolist(),
+            "final_error_mm": final_error * 1000.0,
+        }
+
+    def start_actual_recording(self, path: Path):
+        self.actual_stream = Path(path).open("x", encoding="utf-8", buffering=1)
+        self.actual_samples = []
+        self.last_logged_state_time = None
+        self.joint_velocity_window = VectorVelocityWindow()
+        self.magnet_velocity_window = VectorVelocityWindow()
+        self.tool_angular_velocity_window = AngularVelocityWindow()
+        self.execution_validator = self.monitor_execution_state
+
+    def stop_actual_recording(self):
+        self.execution_validator = None
+        if self.actual_stream is not None:
+            self.actual_stream.close()
+            self.actual_stream = None
+
+    def monitor_execution_state(self, _robot_state):
+        if self.robot_program_running is False:
+            raise RuntimeError("External Control program stopped during execution")
+        received = self.joint_state_received_at
+        if received is None:
+            return
+        message = self.latest_joint_state
+        sample_time = joint_state_sample_time(message, received)
+        if (
+            self.last_logged_state_time is not None
+            and sample_time <= self.last_logged_state_time
+        ):
+            return
+        mapping = dict(zip(message.name, message.position))
+        positions = np.asarray([mapping[name] for name in JOINT_NAMES], dtype=float)
+        checked = self.geometry.inspect(
+            JOINT_NAMES,
+            positions,
+            allow_workspace_ingress=self.allow_workspace_ingress,
+        )
+        if checked["workspace_outside"]:
+            if self.live_workspace_entered:
+                raise RuntimeError(
+                    "robot left the workspace after entering it"
+                )
+            violation = np.asarray(
+                checked["workspace_violation_mm"], dtype=float
+            )
+            if (
+                self.live_workspace_violation_mm is not None
+                and np.any(
+                    violation
+                    > self.live_workspace_violation_mm
+                    + WORKSPACE_INGRESS_TOLERANCE_M * 1000.0
+                )
+            ):
+                raise RuntimeError(
+                    "live workspace-ingress violation increased"
+                )
+            self.live_workspace_violation_mm = violation
+        else:
+            self.live_workspace_entered = True
+        magnet = np.asarray(checked["magnet_world_mm"], dtype=float) / 1000.0
+        self.joint_velocity_window.add(sample_time, positions)
+        self.magnet_velocity_window.add(sample_time, magnet)
+        self.tool_angular_velocity_window.add(
+            sample_time, checked["tool_quaternion_world_xyzw"]
+        )
+        joint_velocity = self.joint_velocity_window.velocity()
+        magnet_velocity = self.magnet_velocity_window.velocity()
+        tool_angular_speed = self.tool_angular_velocity_window.speed()
+        joint_speed = 0.0 if joint_velocity is None else float(
+            np.max(np.abs(joint_velocity))
+        )
+        magnet_speed = 0.0 if magnet_velocity is None else float(
+            np.linalg.norm(magnet_velocity)
+        )
+        measured_tool_angular_speed = (
+            0.0 if tool_angular_speed is None else tool_angular_speed
+        )
+        if joint_velocity is not None and joint_speed > MEASURED_JOINT_SPEED_LIMIT_RAD_S:
+            raise RuntimeError(
+                f"measured joint speed exceeded {math.degrees(MEASURED_JOINT_SPEED_LIMIT_RAD_S):.1f} deg/s"
+            )
+        if magnet_velocity is not None and magnet_speed > self.maximum_live_tcp_speed:
+            raise RuntimeError(
+                f"measured magnet-centre speed exceeded "
+                f"{self.maximum_live_tcp_speed * 1000.0:.1f} mm/s"
+            )
+        if (
+            tool_angular_speed is not None
+            and tool_angular_speed > MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
+        ):
+            raise RuntimeError(
+                "measured tool angular speed exceeded "
+                f"{math.degrees(MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S):.1f} deg/s"
+            )
+        path_error = point_polyline_distance(magnet, self.planned_polyline)
+        if path_error > LIVE_PATH_TOLERANCE_M:
+            raise RuntimeError(
+                f"magnet centre departed planned path by {path_error * 1000.0:.3f} mm"
+            )
+        orientation_path_error = orientation_path_distance(
+            magnet,
+            checked["tool_quaternion_world_xyzw"],
+            self.planned_pose_centres,
+            self.planned_pose_quaternions,
+            LIVE_PATH_TOLERANCE_M + POSE_GUARD_POSITION_STEP_M,
+        )
+        if orientation_path_error > LIVE_ORIENTATION_PATH_TOLERANCE_RAD:
+            raise RuntimeError(
+                "tool orientation departed planned pose path by "
+                f"{math.degrees(orientation_path_error):.3f} deg"
+            )
+        entry = {
+            "host_time_ns": time.time_ns(),
+            "monotonic_s": received,
+            "joint_state_stamp_s": sample_time,
+            "q_rad": positions.tolist(),
+            "joint_speed_deg_s": math.degrees(joint_speed),
+            "magnet_speed_mm_s": magnet_speed * 1000.0,
+            "tool_angular_speed_deg_s": math.degrees(
+                measured_tool_angular_speed
+            ),
+            "path_error_mm": path_error * 1000.0,
+            "orientation_path_error_deg": math.degrees(
+                orientation_path_error
+            ),
+            **checked,
+        }
+        self.actual_samples.append(entry)
+        if self.actual_stream is not None:
+            self.actual_stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
+        self.last_logged_state_time = sample_time
+
+
+def trace_from_plan(path: Path):
+    with Path(path).open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    trace = data.get("planned_trace") or data.get("planning", {}).get("planned_trace")
+    if not isinstance(trace, list) or not trace:
+        raise ValueError(f"no planned_trace in {path}")
+    return trace
+
+
+def requested_route_from_plan(path: Path):
+    with Path(path).open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    route = data.get("planning", {}).get("route_world_m")
+    if route is None:
+        return None
+    points = np.asarray(route, dtype=float)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or len(points) < 2
+        or not np.isfinite(points).all()
+    ):
+        raise ValueError(f"invalid requested route in {path}")
+    return points * 1000.0
+
+
+def trace_from_jsonl(path: Path):
+    values = []
+    with Path(path).open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if "magnet_world_mm" not in value:
+                raise ValueError(f"line {line_number} has no magnet_world_mm")
+            values.append(value)
+    if not values:
+        raise ValueError(f"no trajectory samples in {path}")
+    first = values[0].get(
+        "joint_state_stamp_s", values[0].get("monotonic_s", 0.0)
+    )
+    for index, value in enumerate(values):
+        timestamp = value.get(
+            "joint_state_stamp_s", value.get("monotonic_s", float(index))
+        )
+        value.setdefault("time_s", timestamp - first)
+    return values
+
+
+def plot_trajectory(input_path: Path, output_path: Path):
+    input_path = Path(input_path)
+    planned = actual = requested = None
+    if input_path.is_dir():
+        plan_path = input_path / "plan.json"
+        actual_path = input_path / "actual_magnet_path.jsonl"
+        if plan_path.exists():
+            planned = trace_from_plan(plan_path)
+            requested = requested_route_from_plan(plan_path)
+        if actual_path.exists() and actual_path.stat().st_size:
+            actual = trace_from_jsonl(actual_path)
+    elif input_path.suffix.lower() == ".jsonl":
+        actual = trace_from_jsonl(input_path)
+    else:
+        planned = trace_from_plan(input_path)
+        requested = requested_route_from_plan(input_path)
+    if planned is None and actual is None:
+        raise ValueError("no planned or measured magnet-centre trace found")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, (axis_xy, axis_time) = plt.subplots(1, 2, figsize=(12, 5))
+    if requested is not None:
+        axis_xy.plot(
+            requested[:, 0],
+            requested[:, 1],
+            ":",
+            color="black",
+            linewidth=1.2,
+            label="requested",
+        )
+        axis_xy.scatter(
+            requested[1:, 0],
+            requested[1:, 1],
+            marker=".",
+            color="black",
+            s=18,
+        )
+    for label, trace, style in (
+        ("planned", planned, "--"),
+        ("measured", actual, "-"),
+    ):
+        if trace is None:
+            continue
+        points = np.asarray([entry["magnet_world_mm"] for entry in trace], dtype=float)
+        times = np.asarray([entry.get("time_s", index * TRACE_INTERVAL_S)
+                            for index, entry in enumerate(trace)], dtype=float)
+        times -= times[0]
+        axis_xy.plot(points[:, 0], points[:, 1], style, label=label)
+        axis_time.plot(times, points[:, 0], style, label=f"X {label}")
+        axis_time.plot(times, points[:, 1], style, label=f"Y {label}")
+        axis_time.plot(times, points[:, 2], style, label=f"Z {label}")
+        axis_xy.scatter(points[0, 0], points[0, 1], marker="o", s=30)
+        axis_xy.scatter(points[-1, 0], points[-1, 1], marker="x", s=40)
+    axis_xy.set_title("Magnet-centre path in table_world")
+    axis_xy.set_xlabel("X [mm]")
+    axis_xy.set_ylabel("Y [mm]")
+    axis_xy.axis("equal")
+    axis_xy.grid(True)
+    axis_xy.legend()
+    axis_time.set_title("Magnet-centre coordinates")
+    axis_time.set_xlabel("Time [s]")
+    axis_time.set_ylabel("Position [mm]")
+    axis_time.grid(True)
+    axis_time.legend(fontsize="small", ncol=2)
+    figure.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+    return output_path
+
+
+def add_motion_arguments(parser):
+    parser.add_argument("--speed-mm-s", type=float, default=5.0)
+    parser.add_argument(
+        "--motor-axis-parallel",
+        choices=("x", "y", "z"),
+        help=(
+            "at the final pose, make the verified motor shaft parallel to "
+            "this table_world axis"
+        ),
+    )
+    parser.add_argument(
+        "--motor-axis-direction",
+        choices=("nearest", "positive", "negative"),
+        default="nearest",
+        help=(
+            "choose +axis, -axis, or the direction requiring the smallest "
+            "rotation (default: nearest)"
+        ),
+    )
+    parser.add_argument(
+        "--motor-axis-roll-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "remaining roll about the selected world axis after alignment; "
+            "useful for choosing a reachable wrist posture (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--axis-alignment-phase",
+        choices=("before", "after"),
+        default="after",
+        help=(
+            "rotate about the magnet centre before or after the requested "
+            "position path (default: after)"
+        ),
+    )
+    parser.add_argument(
+        "--planning-chunk-mm",
+        type=float,
+        help=(
+            "plan the requested polyline as consecutive short Cartesian "
+            "segments; useful near a kinematic branch boundary"
+        ),
+    )
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--confirmation-token", default="")
+    parser.add_argument(
+        "--accept-provisional-tool-envelope",
+        action="store_true",
+        help="acknowledge that bracket/cable geometry is not fully measured",
+    )
+    parser.add_argument("--motor-stopped", action="store_true")
+    parser.add_argument("--onsite-clearance-confirmed", action="store_true")
+    parser.add_argument("--sole-operator-confirmed", action="store_true")
+    parser.add_argument("--external-control-only-confirmed", action="store_true")
+    parser.add_argument(
+        "--allow-workspace-ingress",
+        action="store_true",
+        help=(
+            "allow only a bounded, monotonic recovery from an already "
+            "out-of-workspace start"
+        ),
+    )
+
+
+def parse_arguments(arguments):
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    point = subparsers.add_parser("point", help="move magnet centre to one point")
+    point.add_argument("--target-mm", nargs=3, type=float, required=True,
+                       metavar=("X", "Y", "Z"))
+    add_motion_arguments(point)
+
+    square = subparsers.add_parser("square", help="trace a closed XY square")
+    square.add_argument("--center-mm", nargs=3, type=float, required=True,
+                        metavar=("X", "Y", "Z"))
+    square.add_argument("--size-mm", type=float, required=True)
+    square.add_argument("--rotation-deg", type=float, default=0.0)
+    square.add_argument("--clockwise", action="store_true")
+    add_motion_arguments(square)
+
+    circle = subparsers.add_parser("circle", help="trace a closed XY circle")
+    circle.add_argument("--center-mm", nargs=3, type=float, required=True,
+                        metavar=("X", "Y", "Z"))
+    circle.add_argument("--radius-mm", type=float, required=True)
+    circle.add_argument("--samples", type=int)
+    circle.add_argument("--start-angle-deg", type=float, default=0.0)
+    circle.add_argument("--clockwise", action="store_true")
+    add_motion_arguments(circle)
+
+    waypoints = subparsers.add_parser("waypoints", help="load YAML/JSON/CSV points")
+    waypoints.add_argument("--file", type=Path, required=True)
+    add_motion_arguments(waypoints)
+
+    plot = subparsers.add_parser("plot", help="plot a saved plan or measured JSONL")
+    plot.add_argument("--input", type=Path, required=True)
+    plot.add_argument("--output", type=Path)
+    return parser.parse_args(arguments)
+
+
+def requested_targets(arguments):
+    if arguments.command == "point":
+        return build_point_targets(arguments.target_mm)
+    if arguments.command == "square":
+        return build_square_targets(
+            arguments.center_mm,
+            arguments.size_mm,
+            arguments.rotation_deg,
+            arguments.clockwise,
+        )
+    if arguments.command == "circle":
+        return build_circle_targets(
+            arguments.center_mm,
+            arguments.radius_mm,
+            arguments.samples,
+            arguments.clockwise,
+            arguments.start_angle_deg,
+        )
+    if arguments.command == "waypoints":
+        return load_waypoint_targets(arguments.file)
+    raise ValueError(f"unsupported motion command: {arguments.command}")
+
+
+def default_output_directory(command):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return project_root() / "robot" / "trajectory_runs" / f"{stamp}_{command}"
+
+
+def trajectory_points_for_report(trajectory):
+    return [
+        {
+            "time_s": duration_seconds(point.time_from_start),
+            "positions_rad": list(point.positions),
+            "velocities_rad_s": list(point.velocities),
+            "accelerations_rad_s2": list(point.accelerations),
+        }
+        for point in trajectory.points
+    ]
+
+
+def main(args=None):
+    parsed = parse_arguments(sys.argv[1:] if args is None else args)
+    if parsed.command == "plot":
+        output = parsed.output
+        if output is None:
+            output = (parsed.input if parsed.input.is_dir() else parsed.input.parent) / "magnet_path.png"
+        result = plot_trajectory(parsed.input, output)
+        print(result)
+        return
+
+    if not math.isfinite(parsed.speed_mm_s) or not 0.1 <= parsed.speed_mm_s <= 20.0:
+        raise SystemExit("speed must be within [0.1, 20] mm/s")
+    if parsed.planning_chunk_mm is not None and (
+        not math.isfinite(parsed.planning_chunk_mm)
+        or not MIN_PLANNING_CHUNK_M * 1000.0
+        <= parsed.planning_chunk_mm
+        <= MAX_PLANNING_CHUNK_M * 1000.0
+    ):
+        raise SystemExit(
+            "planning chunk must be within "
+            f"[{MIN_PLANNING_CHUNK_M * 1000.0:.0f}, "
+            f"{MAX_PLANNING_CHUNK_M * 1000.0:.0f}] mm"
+        )
+    if (
+        parsed.motor_axis_parallel is None
+        and (
+            parsed.motor_axis_direction != "nearest"
+            or abs(parsed.motor_axis_roll_deg) > 1.0e-12
+        )
+    ):
+        raise SystemExit(
+            "motor-axis direction/roll requires --motor-axis-parallel"
+        )
+    if (
+        not math.isfinite(parsed.motor_axis_roll_deg)
+        or not -180.0 <= parsed.motor_axis_roll_deg <= 180.0
+    ):
+        raise SystemExit("motor-axis roll must be within [-180, 180] degrees")
+    if parsed.execute and parsed.confirmation_token != EXECUTION_TOKEN:
+        raise SystemExit("execution refused: confirmation token is missing or invalid")
+    if parsed.execute and not parsed.accept_provisional_tool_envelope:
+        raise SystemExit(
+            "execution refused: current complete-tool envelope is provisional; "
+            "pass --accept-provisional-tool-envelope only after onsite verification"
+        )
+    execution_confirmations = {
+        "motor_stopped": parsed.motor_stopped,
+        "onsite_clearance_confirmed": parsed.onsite_clearance_confirmed,
+        "sole_operator_confirmed": parsed.sole_operator_confirmed,
+        "external_control_only_confirmed": parsed.external_control_only_confirmed,
+    }
+    if parsed.execute and not all(execution_confirmations.values()):
+        missing = [
+            name for name, confirmed in execution_confirmations.items()
+            if not confirmed
+        ]
+        raise SystemExit(
+            "execution refused: fresh onsite confirmations are missing: "
+            + ", ".join(missing)
+        )
+    try:
+        targets, shape = requested_targets(parsed)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise SystemExit(str(error)) from error
+
+    output = (parsed.output or default_output_directory(parsed.command)).resolve()
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as error:
+        raise SystemExit(f"refusing to overwrite existing output directory: {output}") from error
+
+    root = project_root()
+    report = {
+        "schema": PATH_SCHEMA,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "command": parsed.command,
+        "shape": shape,
+        "frame": "table_world",
+        "units": {"position": "mm", "time": "s", "joint": "rad"},
+        "requested_speed_mm_s": float(parsed.speed_mm_s),
+        "requested_motor_axis_parallel": parsed.motor_axis_parallel,
+        "requested_motor_axis_direction": parsed.motor_axis_direction,
+        "requested_motor_axis_roll_deg": float(parsed.motor_axis_roll_deg),
+        "requested_axis_alignment_phase": parsed.axis_alignment_phase,
+        "execute_requested": bool(parsed.execute),
+        "execution_confirmations": execution_confirmations,
+        "controls_motor": False,
+        "workspace_ingress_requested": bool(parsed.allow_workspace_ingress),
+        "planning_chunk_requested_mm": parsed.planning_chunk_mm,
+        "motion_sent": False,
+        "execution_allowed_by_file": False,
+        "tool_geometry_provisional": True,
+        "config_sha256": config_hashes(root),
+        "global_clearance_mm": {
+            key: value * 1000.0 for key, value in load_clearance_limits_m(root).items()
+        },
+        "additional_execution_reserve_mm": STOPPING_RESERVE_M * 1000.0,
+        "limitations": [
+            "application-level guard; not a certified safety function",
+            "complete rigid tool envelope is provisional",
+            "cables, platform posts and loose obstacles are not completely modeled",
+            "PolyScope safety planes and payload settings are external to this report",
+        ],
+    }
+
+    rclpy.init()
+    node = None
+    actual_path = output / "actual_magnet_path.jsonl"
+    try:
+        node = MagnetTrajectoryNode()
+        node.wait_for_fresh_state(
+            timeout=5.0, require_execution_state=parsed.execute
+        )
+        velocities = list(node.latest_joint_state.velocity)
+        if velocities and (
+            len(velocities) != len(node.latest_joint_state.position)
+            or not np.isfinite(velocities).all()
+        ):
+            raise RuntimeError("robot reported an invalid joint velocity vector")
+        if parsed.execute and not velocities:
+            raise RuntimeError("joint velocity feedback is required for execution")
+        if velocities and max(abs(value) for value in velocities) > 0.002:
+            raise RuntimeError("robot must be stationary before planning")
+        planning = node.plan_magnet_targets(
+            targets,
+            parsed.speed_mm_s / 1000.0,
+            allow_workspace_ingress=parsed.allow_workspace_ingress,
+            planning_chunk_m=(
+                None
+                if parsed.planning_chunk_mm is None
+                else parsed.planning_chunk_mm / 1000.0
+            ),
+            motor_axis_parallel=parsed.motor_axis_parallel,
+            motor_axis_direction=parsed.motor_axis_direction,
+            motor_axis_roll_deg=parsed.motor_axis_roll_deg,
+            axis_alignment_phase=parsed.axis_alignment_phase,
+        )
+        trajectory = planning.pop("solution")
+        planning.pop("start_state")
+        planned_trace = planning.pop("planned_trace")
+        report["execution_allowed_by_file"] = (
+            node.ceiling_guard.tool_data.get("execution_allowed") is True
+        )
+        report["tool_geometry_provisional"] = bool(
+            node.ceiling_guard.provisional
+        )
+        report.update(
+            planning=planning,
+            joint_names=list(trajectory.joint_trajectory.joint_names),
+            trajectory_points=trajectory_points_for_report(
+                trajectory.joint_trajectory
+            ),
+            provisional_tool_envelope_accepted_for_execution=bool(
+                parsed.accept_provisional_tool_envelope
+            ),
+        )
+        # Keep the trace at top level so the plotting command can consume a
+        # plan without knowing how the rest of the report is organized.
+        report["planned_trace"] = planned_trace
+        node.wait_for_fresh_state(
+            timeout=2.0, require_execution_state=parsed.execute
+        )
+        report["start_mismatch_rad"] = node.verify_start(trajectory)
+        write_json_exclusive(output / "plan.json", report)
+        plot_trajectory(output / "plan.json", output / "magnet_path.png")
+        print(
+            "PLAN_OK "
+            f"shape={parsed.command} fraction={planning['fraction']:.6f} "
+            f"length={planning['total_length_m'] * 1000.0:.3f}mm "
+            f"duration={planning['duration_s']:.3f}s "
+            f"samples={len(planned_trace)}"
+        )
+        print(
+            "START_MAGNET_WORLD_MM="
+            + ",".join(f"{value * 1000.0:.3f}" for value in planning["start_magnet_world_m"])
+        )
+        print(
+            "FINAL_TARGET_WORLD_MM="
+            + ",".join(f"{value * 1000.0:.3f}" for value in planning["targets_world_m"][-1])
+        )
+        if planning["motor_axis_alignment"] is not None:
+            alignment = planning["motor_axis_alignment"]
+            print(
+                "FINAL_MOTOR_AXIS_WORLD="
+                + ",".join(
+                    f"{value:.6f}"
+                    for value in alignment["planned_final_axis_world"]
+                )
+            )
+            print(
+                "AXIS_ALIGNMENT="
+                f"table_world_{alignment['selected_direction']}"
+                f"{alignment['world_axis'].upper()} "
+                f"rotation={alignment['minimum_rotation_deg']:.3f}deg "
+                f"roll={alignment['roll_about_target_axis_deg']:.3f}deg "
+                f"phase={alignment['phase']} "
+                f"error={alignment['planned_final_axis_error_deg']:.4f}deg"
+            )
+        if not parsed.execute:
+            print("PLAN_ONLY: no command sent to the robot")
+            print(output / "plan.json")
+            print(output / "magnet_path.png")
+            return
+
+        if node.ceiling_guard.provisional is not True:
+            # The explicit acknowledgement is harmless when the model later
+            # becomes verified, but the report must reflect the actual state.
+            report["tool_geometry_provisional"] = False
+        if config_hashes(root) != report["config_sha256"]:
+            raise RuntimeError("configuration files changed after planning")
+        node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
+        live_velocities = list(node.latest_joint_state.velocity)
+        if (
+            not live_velocities
+            or not np.isfinite(live_velocities).all()
+            or max(abs(value) for value in live_velocities) > 0.002
+        ):
+            raise RuntimeError("robot must be stationary immediately before execution")
+        node.start_actual_recording(actual_path)
+        report["execution_attempted"] = True
+        try:
+            node.execute(trajectory)
+            node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
+            node.monitor_execution_state(node.current_robot_state())
+        finally:
+            report["motion_sent"] = bool(node.execution_goal_sent)
+            report["dashboard_stop_attempted"] = bool(
+                node.dashboard_stop_attempted
+            )
+            report["dashboard_stop_succeeded"] = bool(
+                node.dashboard_stop_succeeded
+            )
+            report["dashboard_stop_message"] = node.dashboard_stop_message
+            node.stop_actual_recording()
+        if not node.actual_samples:
+            raise RuntimeError("execution completed without measured trajectory samples")
+        final_measured = np.asarray(
+            node.actual_samples[-1]["magnet_world_mm"], dtype=float
+        ) / 1000.0
+        final_error = float(np.linalg.norm(final_measured - targets[-1]))
+        if final_error > FINAL_POSITION_TOLERANCE_M:
+            raise RuntimeError(
+                f"measured final magnet error is {final_error * 1000.0:.3f} mm"
+            )
+        final_measured_axis = normalized_vector(
+            node.actual_samples[-1]["motor_axis_world"],
+            "measured final motor axis",
+        )
+        final_axis_error = None
+        if node.target_motor_axis_world is not None:
+            final_axis_error = math.acos(float(np.clip(
+                np.dot(final_measured_axis, node.target_motor_axis_world),
+                -1.0,
+                1.0,
+            )))
+            if final_axis_error > FINAL_AXIS_TOLERANCE_RAD:
+                raise RuntimeError(
+                    "measured final motor-axis error is "
+                    f"{math.degrees(final_axis_error):.3f} deg"
+                )
+        execution = {
+            "completed": True,
+            "motion_sent": bool(node.execution_goal_sent),
+            "dashboard_stop_attempted": bool(node.dashboard_stop_attempted),
+            "dashboard_stop_succeeded": bool(node.dashboard_stop_succeeded),
+            "dashboard_stop_message": node.dashboard_stop_message,
+            "sample_count": len(node.actual_samples),
+            "final_magnet_world_mm": (final_measured * 1000.0).tolist(),
+            "final_error_mm": final_error * 1000.0,
+            "final_motor_axis_world": final_measured_axis.tolist(),
+            "final_motor_axis_error_deg": (
+                None
+                if final_axis_error is None
+                else math.degrees(final_axis_error)
+            ),
+            "maximum_path_error_mm": max(
+                value["path_error_mm"] for value in node.actual_samples
+            ),
+            "maximum_measured_joint_speed_deg_s": max(
+                value["joint_speed_deg_s"] for value in node.actual_samples
+            ),
+            "maximum_measured_magnet_speed_mm_s": max(
+                value["magnet_speed_mm_s"] for value in node.actual_samples
+            ),
+            "maximum_measured_tool_angular_speed_deg_s": max(
+                value["tool_angular_speed_deg_s"]
+                for value in node.actual_samples
+            ),
+            "maximum_orientation_path_error_deg": max(
+                value["orientation_path_error_deg"]
+                for value in node.actual_samples
+            ),
+        }
+        write_json_exclusive(output / "execution.json", execution)
+        plot_trajectory(output, output / "magnet_path.png")
+        print("EXECUTION_SUCCESS " + json.dumps(execution, ensure_ascii=False))
+        print(actual_path)
+        print(output / "magnet_path.png")
+    except BaseException as error:
+        if node is not None:
+            node.stop_actual_recording()
+            report["motion_sent"] = bool(node.execution_goal_sent)
+        failure = {
+            "failed_utc": datetime.now(timezone.utc).isoformat(),
+            "motion_sent": bool(report.get("motion_sent")),
+            "error": str(error),
+        }
+        if node is not None:
+            failure.update(
+                dashboard_stop_attempted=bool(node.dashboard_stop_attempted),
+                dashboard_stop_succeeded=bool(node.dashboard_stop_succeeded),
+                dashboard_stop_message=node.dashboard_stop_message,
+            )
+        failure_path = output / "failure.json"
+        if not failure_path.exists():
+            write_json_exclusive(failure_path, failure)
+        if actual_path.exists() and actual_path.stat().st_size:
+            try:
+                plot_trajectory(output, output / "magnet_path.png")
+            except Exception:
+                pass
+        if node is not None:
+            node.get_logger().error(str(error))
+        else:
+            print(str(error), file=sys.stderr)
+        raise SystemExit(1) from error
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

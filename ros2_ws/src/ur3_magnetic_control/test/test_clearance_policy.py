@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 import tempfile
 import unittest
 
@@ -6,9 +7,16 @@ import yaml
 
 from ur3_magnetic_control.acrylic_ceiling_guard import (
     AcrylicCeilingGuard,
+    CEILING_OBJECT_ID,
     LEFT_OBJECT_ID,
     RIGHT_OBJECT_ID,
     load_guard_configuration,
+    transform_point,
+)
+from ur3_magnetic_control.acrylic_geometry import (
+    acrylic_ceiling_gap_m,
+    acrylic_inner_lower_left_world_xy_m,
+    modeled_boundary_gaps_m,
 )
 from ur3_magnetic_control.clearance_policy import (
     DEFAULT_PROJECT_ROOT,
@@ -57,6 +65,79 @@ class ClearancePolicyTests(unittest.TestCase):
         )
         self.assertAlmostEqual(configuration["left_guard_world_x_m"], -0.130)
         self.assertAlmostEqual(configuration["right_guard_world_x_m"], 0.580)
+        self.assertEqual(
+            configuration["acrylic_inner_lower_left_world_xy_m"], [0.135, 0.025]
+        )
+        self.assertAlmostEqual(configuration["ceiling_region_min_world_y_m"], 0.025)
+
+    def test_ceiling_exemption_requires_complete_geometry_below_lower_edge(self):
+        table = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/table_world_calibration.yaml").read_text()
+        )
+        self.assertEqual(acrylic_inner_lower_left_world_xy_m(table), (0.135, 0.025))
+        self.assertEqual(
+            acrylic_ceiling_gap_m(table, [0.0, 0.010, 0.0], [0.1, 0.0249, 0.60]),
+            float("inf"),
+        )
+        for lower_y, upper_y in [(0.010, 0.025), (0.010, 0.030), (0.025, 0.030)]:
+            with self.subTest(lower_y=lower_y, upper_y=upper_y):
+                self.assertAlmostEqual(
+                    acrylic_ceiling_gap_m(
+                        table, [0.0, lower_y, 0.0], [0.1, upper_y, 0.480]
+                    ),
+                    0.010741,
+                )
+
+    def test_x_corner_is_recorded_but_does_not_create_an_x_exemption(self):
+        table = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/table_world_calibration.yaml").read_text()
+        )
+        sides = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/acrylic_side_boundaries.yaml").read_text()
+        )
+        gaps = modeled_boundary_gaps_m(
+            table, sides, [-0.20, 0.030, 0.0], [0.10, 0.040, 0.480]
+        )
+        self.assertAlmostEqual(gaps["ceiling"], 0.010741)
+
+    def test_missing_or_ambiguous_footprint_fails_closed(self):
+        table = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/table_world_calibration.yaml").read_text()
+        )
+        variants = []
+        missing = copy.deepcopy(table)
+        del missing["fixed_work_surface"]["acrylic_footprint"]
+        variants.append(missing)
+        wrong_model = copy.deepcopy(table)
+        wrong_model["fixed_work_surface"]["acrylic_footprint"][
+            "ceiling_region_model"
+        ] = "unknown"
+        variants.append(wrong_model)
+        nonfinite = copy.deepcopy(table)
+        nonfinite["fixed_work_surface"]["acrylic_footprint"][
+            "inner_lower_left_world_xy_m"
+        ] = [0.135, float("nan")]
+        variants.append(nonfinite)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                acrylic_ceiling_gap_m(
+                    variant, [0.0, 0.0, 0.0], [0.1, 0.020, 0.480]
+                )
+
+    def test_moveit_ceiling_box_starts_at_measured_lower_y_edge(self):
+        guard = object.__new__(AcrylicCeilingGuard)
+        guard.configuration = load_guard_configuration()
+        item = guard._forbidden_ceiling_object()
+        self.assertEqual(item.id, CEILING_OBJECT_ID)
+        self.assertEqual(list(item.primitives[0].dimensions), [2.0, 2.0, 1.0])
+        expected = transform_point(
+            guard.configuration["T_base_from_world"],
+            [0.0, 1.025, guard.configuration["guard_world_z_m"] + 0.5],
+        )
+        actual = item.primitive_poses[0].position
+        self.assertAlmostEqual(actual.x, expected[0])
+        self.assertAlmostEqual(actual.y, expected[1])
+        self.assertAlmostEqual(actual.z, expected[2])
 
     def test_moveit_scene_contains_both_side_forbidden_regions(self):
         guard = object.__new__(AcrylicCeilingGuard)

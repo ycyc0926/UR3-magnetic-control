@@ -13,6 +13,7 @@
   - 机械臂测试统一移到 robot/tests/。
   - 硬件照片、坐标图和论文统一移到 docs/。
   - 历史交接和实验进展移到 docs/history/。
-  - 规划、执行和 RTDE 记录保留在 robot/planning_checks/。
+  - 旧规划审计记录位于 robot/planning_checks/，统一轨迹运行记录位于
+    robot/trajectory_runs/；两者都只在实验电脑保留。
   - 四段 H 明显移动的录像集中建立了快捷入口：移动录像目录 (camera/
     motion_examples/README.md)。

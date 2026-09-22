@@ -14,6 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64
+from std_srvs.srv import Trigger
 
 from .acrylic_ceiling_guard import AcrylicCeilingGuard
 
@@ -36,14 +37,38 @@ def set_duration(duration, seconds):
     duration.nanosec = nanos
 
 
+def normalize_speed_scaling(value):
+    """Return ``(factor, percent)`` for factor- or percent-style feedback."""
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0 or value > 100.0:
+        raise ValueError("robot speed scaling is outside (0, 100]")
+    factor = value if value <= 1.0 else value / 100.0
+    return factor, (value * 100.0 if value <= 1.0 else value)
+
+
 class CartesianLineMove(Node):
-    def __init__(self):
-        super().__init__("cartesian_line_move")
+    def __init__(
+        self,
+        node_name="cartesian_line_move",
+        guard_factory=AcrylicCeilingGuard,
+    ):
+        """Create the reusable Cartesian-motion client.
+
+        ``node_name`` and ``guard_factory`` are injectable so higher-level
+        tools can reuse the state, planning and execution plumbing while
+        supplying a stricter attached-tool/environment model.  Existing users
+        retain the original defaults.
+        """
+        super().__init__(node_name)
         self.latest_joint_state = None
         self.joint_state_received_at = None
         self.execution_validator = None
         self.robot_program_running = None
         self.speed_scaling_percent = None
+        self.execution_goal_sent = False
+        self.dashboard_stop_attempted = False
+        self.dashboard_stop_succeeded = False
+        self.dashboard_stop_message = None
         state_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -75,7 +100,10 @@ class CartesianLineMove(Node):
         self.execute_client = ActionClient(
             self, ExecuteTrajectory, "/execute_trajectory"
         )
-        self.ceiling_guard = AcrylicCeilingGuard(self)
+        self.dashboard_stop_client = self.create_client(
+            Trigger, "/dashboard_client/stop"
+        )
+        self.ceiling_guard = guard_factory(self)
 
     def on_joint_state(self, message):
         self.latest_joint_state = message
@@ -261,16 +289,50 @@ class CartesianLineMove(Node):
             )
         return maximum
 
+    def stop_robot_program(self, timeout=3.0):
+        """Request a UR Dashboard program stop and verify its response."""
+        self.dashboard_stop_attempted = True
+        self.dashboard_stop_succeeded = False
+        self.dashboard_stop_message = None
+        if not self.dashboard_stop_client.wait_for_service(timeout_sec=timeout):
+            raise RuntimeError("UR Dashboard stop service is unavailable")
+        future = self.dashboard_stop_client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        response = future.result() if future.done() else None
+        if response is None:
+            raise RuntimeError("UR Dashboard stop service timed out")
+        self.dashboard_stop_message = str(response.message)
+        self.dashboard_stop_succeeded = bool(response.success)
+        if not response.success:
+            raise RuntimeError(
+                f"UR Dashboard rejected stop request: {response.message}"
+            )
+        return response.message
+
     def execute(self, trajectory):
+        self.execution_goal_sent = False
         self.verify_start(trajectory, tolerance=0.002)
         if not self.robot_program_running:
             raise RuntimeError("External Control program is not running")
-        if self.speed_scaling_percent is None or self.speed_scaling_percent <= 0:
+        if self.speed_scaling_percent is None:
             raise RuntimeError('Robot speed scaling is zero or unavailable')
+        try:
+            speed_scaling, display_percent = normalize_speed_scaling(
+                self.speed_scaling_percent
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         if not self.execute_client.wait_for_server(timeout_sec=5.0):
             raise RuntimeError("MoveIt execute trajectory action is unavailable")
+        if not self.dashboard_stop_client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError(
+                "UR Dashboard stop service is unavailable; execution refused"
+            )
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = trajectory
+        # Set this immediately before the action request so failure reports are
+        # conservative even if the middleware raises while sending it.
+        self.execution_goal_sent = True
         goal_future = self.execute_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, goal_future, timeout_sec=5.0)
         goal_handle = goal_future.result()
@@ -280,10 +342,13 @@ class CartesianLineMove(Node):
         planned_duration = duration_seconds(
             trajectory.joint_trajectory.points[-1].time_from_start
         )
-        scale = max(0.01, min(1.0, self.speed_scaling_percent / 100.0))
+        # The UR speed-scaling broadcaster normally publishes a factor in
+        # [0, 1].  Accept [0, 100] percentages as a compatibility fallback for
+        # older/local publishers, but normalize before computing the timeout.
+        scale = max(0.01, min(1.0, speed_scaling))
         execution_timeout = max(60.0, planned_duration / scale * 1.5 + 10.0)
         print(
-            f"SPEED_SCALING={self.speed_scaling_percent:.1f}% "
+            f"SPEED_SCALING={display_percent:.1f}% "
             f"EXECUTION_TIMEOUT={execution_timeout:.1f}s"
         )
         deadline = time.monotonic() + execution_timeout
@@ -295,6 +360,19 @@ class CartesianLineMove(Node):
                 if self.execution_validator is not None:
                     self.execution_validator(self.current_robot_state())
         except BaseException:
+            # MoveIt cancellation alone does not guarantee that a trajectory
+            # already buffered by the UR controller stops promptly.  Stop the
+            # External Control program first, then cancel the ROS action.
+            try:
+                message = self.stop_robot_program(timeout=3.0)
+                self.get_logger().error(
+                    f"execution guard requested UR Dashboard stop: {message}"
+                )
+            except BaseException as stop_error:
+                self.get_logger().fatal(
+                    f"UR Dashboard stop failed; use hardware emergency stop: "
+                    f"{stop_error}"
+                )
             cancel = goal_handle.cancel_goal_async()
             rclpy.spin_until_future_complete(self, cancel, timeout_sec=2.0)
             rclpy.spin_until_future_complete(self, result_future, timeout_sec=5.0)

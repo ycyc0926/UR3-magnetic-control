@@ -1,8 +1,0 @@
-{
-  "clearance_limits_mm": {
-    "ceiling": 3.0,
-    "left": 10.0,
-    "right": 10.0,
-    "table": 10.0
-  }
-}

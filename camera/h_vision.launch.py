@@ -9,7 +9,8 @@ def generate_launch_description():
     config = '/home/yc/UR3/ros2_ws/src/ur3_magnetic_control/config/flir_vision.yaml'
     camera = ExecuteProcess(cmd=['/usr/bin/python3', '-m', 'ur3_magnetic_control.camera_node',
                                  '--ros-args', '--params-file', config], output='screen')
-    tracker = ExecuteProcess(cmd=['/usr/bin/python3', '-m', 'ur3_magnetic_control.h_tracker_node'], output='screen')
+    tracker = ExecuteProcess(cmd=['/usr/bin/python3', '-m', 'ur3_magnetic_control.h_tracker_node',
+                                  '--ros-args', '--params-file', config], output='screen')
     return LaunchDescription([
         camera, tracker,
         RegisterEventHandler(OnProcessExit(target_action=tracker,

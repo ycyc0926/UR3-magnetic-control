@@ -1,15 +1,22 @@
-# 只读换向碰撞诊断
+# 只读碰撞与插值诊断
 
-这个程序只在内存中构造 MoveIt PlanningScene/FCL。没有 ROS 节点、硬件驱动、发布器、网络连接或执行接口。Python 包装程序默认只读取一次 RTDE 输出；指定 `--snapshot` 时不连接机械臂。
+这两个程序只在内存中运行 MoveIt/FCL 碰撞检查或控制器样条插值。没有 ROS 节点、
+硬件驱动、发布器、网络连接或执行接口。
 
 ```bash
 source /home/yc/UR3/ros2_env.sh
 cmake -S /home/yc/UR3/robot/offline_collision -B /home/yc/UR3/robot/offline_collision/build -DCMAKE_BUILD_TYPE=Release
 cmake --build /home/yc/UR3/robot/offline_collision/build -j2
-python3 /home/yc/UR3/robot/preview_yaw_clearance.py --output /home/yc/UR3/robot/planning_checks/NEW_DIRECTORY
 ```
 
-输出目录必须不存在。结果中的关节采样没有时间参数，**不能送给控制器执行**。`sampled_geometry_pass` 仅指当前假设下的离散模型检查；`execution_allowed` 始终为 false。
+命令行接口分别为：
+
+```text
+check_self_collision URDF SRDF diagnostic.json
+sample_timed_trajectory draft.json
+```
+
+输入必须由当前通用规划流程另行生成和审核；程序输出**不能送给控制器执行**。
 
 检查范围：
 

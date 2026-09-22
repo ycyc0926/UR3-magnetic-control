@@ -4,14 +4,16 @@
 
 ## 安全约定
 
-- `mock_system.launch.py` 只启动模拟图像、视觉检测、测试路径、模拟电机和安全监控，不连接真实UR3。
-- 模拟电机默认拒绝所有非零转速。
 - 真实驱动启动后不会自行运动；只有显式发送轨迹目标才会运动。
 - 真实运动前必须单独确认坐标系、距离、速度、路径，并把示教器和急停放在手边。
-- 不要同时运行旧的 `ur3_linear_move.py` 和 ROS 2 External Control。
-- 所有正常轨迹、停车模型和在线检查统一使用全局净空策略：亚克力板底
+- 真实运动只使用统一的 `magnet_trajectory` 入口，不要同时运行其他机械臂控制客户端。
+- 所有正常轨迹、停车模型和在线检查统一使用全局净空策略：亚克力覆盖区板底
   `5 mm`、左右侧各 `10 mm`、桌面 `10 mm`。唯一配置位置是
   `config/ur3_system.yaml:safety.clearance_policy_m`，运动脚本不得单独覆盖。
+- 亚克力内侧左下角世界坐标为 `(0.135,0.025) m`，记录在
+  `config/table_world_calibration.yaml`。当前只启用下边缘：完整 link/工具包络
+  `max(Y)<0.025 m` 时免除板底高度限制；触及或跨越该边界仍应用 5 mm 净空。
+  X=0.135 m 暂只记录，不产生 X 方向豁免。
 - 历史规划报告使用过的 `3/18/20/23/100 mm` 阈值只描述当时的审核，配置哈希
   已变化，不能直接重放；必须按当前全局策略重新生成审核。
 
@@ -39,43 +41,17 @@ ulimit -r
 
 当前结果分别为 `6.8.0-138-lowlatency` 和 `99`。更换内核或系统配置后应重新检查。
 
-## 无硬件模拟验证
+## FLIR 相机与 H 目标定位
+
+统一启动脚本使用相机序列号对应的 USB3 设备，以 2448×2048 BayerRG8 采集，
+转换并缩放为 1224×1024 BGR 后发布，同时启动 H 目标定位：
 
 ```bash
-ros2 launch ur3_magnetic_control mock_system.launch.py
+bash /home/yc/UR3/camera/start_h_tracking.sh
 ```
 
-另开终端可查看：
-
-```bash
-source /home/yc/UR3/ros2_env.sh
-ros2 topic list
-ros2 topic echo /safety/status
-```
-
-主要话题：
-
-- `/camera/image_raw`：模拟相机图像
-- `/origami/pose_pixels`：目标像素位置
-- `/origami/confidence`：检测置信度
-- `/desired_path`：100 mm测试直线路径
-- `/motor/command_rpm`：电机转速命令，当前默认被安全拒绝
-- `/motor/state_rpm`：模拟电机状态
-- `/safety/stop_requested`：安全停止请求
-- `/safety/status`：安全状态
-
-## FLIR真实相机ROS采集
-
-以下命令使用相机序列号对应的USB3设备，以2448×2048 BayerRG8采集，在进入ROS前
-转换并缩放为1224×1024 BGR，发布目标为20 FPS：
-
-```bash
-source /home/yc/UR3/ros2_env.sh
-ros2 launch ur3_magnetic_control flir_vision.launch.py
-```
-
-该启动文件不会连接或控制UR3。当前绿色目标检测器只是接口验证版本，折纸机器人
-到货后必须按实际外观重新设计检测方法和阈值。
+该启动方式不会连接或控制 UR3，也不会发送电机命令。详细话题、录像和定位限制见
+[相机程序](../../camera/README.md)。
 
 ## 示教器上的 External Control
 
@@ -120,25 +96,20 @@ ros2 launch ur_robot_driver ur_control.launch.py \
 
 驱动显示等待机器人程序后，再运行示教器中的 `external_control.urp`。
 
-## 受保护的笛卡尔直线节点
+## 统一的磁铁中心轨迹节点
 
-`cartesian_line_move` 默认只规划，不向机械臂发送命令。它使用 MoveIt 笛卡尔
-路径服务进行 2 mm 采样，检查路径覆盖率、自碰撞、关节跳变和带余量的关节限位，
-并处理连续关节的 `2π` 表示。
+机械臂运动统一使用 `magnet_trajectory`。目标坐标是 `table_world` 中的磁铁中心，
+默认只规划；单点、正方形、圆形、多路点和电机轴方向约束共用同一套碰撞、净空、
+关节限位、速度及实测轨迹检查。底层笛卡尔规划实现保留为包内公共模块，不再提供
+容易绕过统一检查的独立运动命令。
 
-规划示例：
+单点规划示例：
 
 ```bash
 source /home/yc/UR3/ros2_env.sh
-ros2 run ur3_magnetic_control cartesian_line_move \
-  --axis=-z --distance-mm 150 --speed-mm-s 10
+ros2 run ur3_magnetic_control magnet_trajectory point \
+  --target-mm 120 10 350 --speed-mm-s 5
 ```
 
-只有显式添加 `--execute` 和确认令牌时才会执行真实运动。真实执行前仍必须确认
-方向、距离、速度、现场净空、示教器限速和急停位置。
-
-2026-09-15 实测：基座 `-Z` 方向规划 150 mm，60 个轨迹点，覆盖率 100%。
-示教器限速 8% 时控制器执行成功；实际 TCP 从约
-`(-50.610, -110.226, 253.597) mm` 到
-`(-50.302, -110.337, 103.688) mm`，Z 位移约 149.909 mm，结束线速度
-0.000 mm/s，安全状态 NORMAL。
+只有显式添加 `--execute` 和全部现场确认参数时才会执行真实运动。完整参数、轨迹
+文件格式、绘图方式和执行门控见 [磁铁中心点位与轨迹脚本](../../robot/MAGNET_TRAJECTORY.md)。

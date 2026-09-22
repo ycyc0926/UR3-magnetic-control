@@ -29,6 +29,8 @@ class HTrackerNode(Node):
         self.declare_parameter('sessions_directory', '/home/yc/UR3/camera/tracking_sessions')
         self.declare_parameter('show_window', False)
         self.declare_parameter('web_preview', True)
+        self.declare_parameter('recording_movement_threshold_mm', 0.5)
+        self.declare_parameter('recording_minimum_detection_fraction', 0.8)
         self.mapper = PlaneMapper(self.get_parameter('calibration_file').value)
         self.detector = DarkTargetTracker()
         self.show_window = bool(self.get_parameter('show_window').value)
@@ -42,7 +44,13 @@ class HTrackerNode(Node):
                               'world_x_mm', 'world_y_mm', 'area_half_px', 'tracking_score'])
         self.events = (self.session/'events.jsonl').open('x', encoding='utf-8')
         self.diagnostics_log = (self.session/'diagnostics.jsonl').open('x', encoding='utf-8')
-        self.recorder = BoundedRecorder(self.session)
+        self.recorder = BoundedRecorder(
+            self.session,
+            movement_threshold_mm=float(
+                self.get_parameter('recording_movement_threshold_mm').value),
+            minimum_detection_fraction=float(
+                self.get_parameter('recording_minimum_detection_fraction').value))
+        self.last_recording_finalization = 0
         self.reference = None
         self.command_error = None
         self.previous_reason = None
@@ -75,7 +83,14 @@ class HTrackerNode(Node):
                     'controls_robot': False, 'controls_motor': False,
                     'timestamp_source': 'host receipt, not hardware trigger',
                     'tracking_score_is_probability': False,
-                    'video': 'Optional bounded unannotated MJPG clips, with per-frame timestamps',
+                    'video': 'Bounded unannotated MJPG clips with per-frame center coordinates',
+                    'recording_filter': {
+                        'signal': 'world XY silhouette center only',
+                        'movement_threshold_mm': self.recorder.movement_threshold_mm,
+                        'minimum_detection_fraction': self.recorder.minimum_detection_fraction,
+                        'static_clips_are_deleted': True,
+                        'insufficient_tracking_is_kept': True,
+                        'kept_clip_trajectory': 'trajectory.png'},
                     'events': 'Operator time markers only; no motor feedback or control',
                     'reference_paths': 'Visual only; no robot reachability or collision validation'}
         (self.session/'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
@@ -86,6 +101,7 @@ class HTrackerNode(Node):
             self.reset((x, y))
 
     def reset(self, seed=None):
+        self.recorder.mark_tracking_discontinuity()
         self.detector.reset(seed)
         self.trail.clear(); self.samples.clear()
         self.origin_xy = None; self.consecutive = 0
@@ -109,6 +125,8 @@ class HTrackerNode(Node):
             if self.last_frame is None or time.monotonic()-self.last_frame > .25:
                 raise RuntimeError('相机无新图像，未开始录像')
             self.recorder.start(value)
+            if self.web:
+                self.web.trajectory = None
             self.event('recording_started', directory=str(self.recorder.directory), duration_s=value,
                        motor_command_sent=False)
         elif command == 'record_stop':
@@ -134,6 +152,26 @@ class HTrackerNode(Node):
                                   'controls_robot': False, 'reachability_checked': False}
             self.event('reference_path_changed', reference=self.reference)
 
+    def sync_recording_result(self):
+        if self.recorder.finalization_serial == self.last_recording_finalization:
+            return
+        status = self.recorder.status()
+        self.last_recording_finalization = self.recorder.finalization_serial
+        if self.web:
+            self.web.trajectory = None
+            trajectory = status.get('trajectory_path')
+            if trajectory:
+                try:
+                    self.web.trajectory = Path(trajectory).read_bytes()
+                except OSError as error:
+                    self.get_logger().warning(f'Could not load trajectory preview: {error}')
+        self.event('recording_finalized', clip_name=status.get('clip_name'),
+                   directory=status.get('directory'), kept=status.get('kept'),
+                   classification=status.get('classification'),
+                   reason=status.get('reason'), motion=status.get('motion'),
+                   trajectory_path=status.get('trajectory_path'),
+                   motor_command_sent=False)
+
     def publish_invalid(self):
         self.detected_pub.publish(Bool(data=False))
         self.score_pub.publish(Float32(data=0.0))
@@ -149,6 +187,7 @@ class HTrackerNode(Node):
                     self.command_error = str(error)
                     self.event('command_rejected', command=command, reason=str(error))
         self.recorder.tick()
+        self.sync_recording_result()
         if self.latest is not None:
             self.latest.update(recording=self.recorder.status(), command_error=self.command_error,
                                reference_path=self.reference)
@@ -202,7 +241,12 @@ class HTrackerNode(Node):
         preview = image.copy()
         stamp = message.header.stamp.sec*10**9+message.header.stamp.nanosec
         reason = diagnostic['reason']
-        self.recorder.write(image, stamp, result is not None, reason)
+        xy = full_pixel = None
+        if result is not None:
+            xy, full_pixel = self.mapper.project(result['pixel'], (1224, 1024))
+        self.recorder.write(image, stamp, result is not None, reason,
+                            None if xy is None else xy*1000)
+        self.sync_recording_result()
         self.diagnostics_log.write(json.dumps({'host_frame_time_ns': stamp,
             'frame': self.frames, 'image_age_s': age, **diagnostic})+'\n')
         if reason != self.previous_reason:
@@ -230,7 +274,6 @@ class HTrackerNode(Node):
             self.writer.writerow([stamp, 0, '', '', '', '', '', 0])
             lines += [f'TARGET LOST ({reason}) - pose paused; click H to reacquire']
         else:
-            xy, full_pixel = self.mapper.project(result['pixel'], (1224, 1024))
             self.successes += 1; self.consecutive += 1
             self.samples.append(xy*1000)
             if self.origin_xy is None:
@@ -292,6 +335,7 @@ class HTrackerNode(Node):
 
     def destroy_node(self):
         self.recorder.stop('viewer_closed')
+        self.sync_recording_result()
         if self.latest is not None:
             self.latest['detected'] = False
             self.latest['viewer_closed'] = True

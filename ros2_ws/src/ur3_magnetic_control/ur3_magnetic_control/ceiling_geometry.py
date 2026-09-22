@@ -110,23 +110,39 @@ class CeilingGeometry:
         base_from_root = np.linalg.inv(transforms['base'])
         return {name: base_from_root @ value for name, value in transforms.items()}
 
-    def heights(self, joints, sphere_xyz, sphere_radius):
+    def bounds(self, joints, sphere_xyz, sphere_radius):
+        """Return conservative world-coordinate AABBs for links and sphere."""
         transforms = self.transforms(joints)
         result = {}
         for link, offset, kind, shape in self.surfaces:
             pose = self.world_from_base @ transforms[link] @ offset
             if kind in ('mesh', 'box'):
-                top = float(np.max(shape @ pose[2, :3]) + pose[2, 3])
+                points = shape @ pose[:3, :3].T + pose[:3, 3]
+                lower, upper = points.min(axis=0), points.max(axis=0)
             elif kind == 'sphere':
-                top = float(pose[2, 3] + shape)
+                lower, upper = pose[:3, 3] - shape, pose[:3, 3] + shape
             else:
                 radius, length = shape
-                top = float(pose[2, 3] + radius * np.linalg.norm(pose[2, :2])
-                            + abs(pose[2, 2]) * length / 2)
-            result[link] = max(top, result.get(link, -np.inf))
+                half = (radius * np.linalg.norm(pose[:3, :2], axis=1)
+                        + np.abs(pose[:3, 2]) * length / 2)
+                lower, upper = pose[:3, 3] - half, pose[:3, 3] + half
+            if link in result:
+                previous_lower, previous_upper = result[link]
+                lower = np.minimum(lower, previous_lower)
+                upper = np.maximum(upper, previous_upper)
+            result[link] = (np.asarray(lower, dtype=float), np.asarray(upper, dtype=float))
         sphere = self.world_from_base @ transforms['tool0'] @ np.r_[sphere_xyz, 1.0]
-        result['magnet_sphere_guard'] = float(sphere[2] + sphere_radius)
+        result['magnet_sphere_guard'] = (
+            sphere[:3] - sphere_radius,
+            sphere[:3] + sphere_radius,
+        )
         return result
+
+    def heights(self, joints, sphere_xyz, sphere_radius):
+        return {
+            name: float(upper[2])
+            for name, (_, upper) in self.bounds(joints, sphere_xyz, sphere_radius).items()
+        }
 
 
 def sample_trajectory(trajectory, interval_s=0.01):
