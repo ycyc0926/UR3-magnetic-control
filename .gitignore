@@ -8,9 +8,6 @@ ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 
-# Standalone CMake generated output
-robot/offline_collision/build/
-
 # Runtime logs
 camera/SpinView_QT_log
 
@@ -20,16 +17,11 @@ camera/SpinView_QT_log
 *~
 .DS_Store
 
-# Large experiment data retained only on the lab computer. Keep the README
-# indexes in Git so clones still explain where the omitted data belong.
+# Large camera experiment data retained only on the lab computer.
 camera/tracking_sessions/*
 !camera/tracking_sessions/README.md
 camera/motion_examples/*.avi
 camera/calibration_samples/*.png
-
-robot/planning_checks/*
-!robot/planning_checks/README.md
-robot/trajectory_runs/
 
 # Local hardware CAD, vendor archives and datasheets are not source code.
 # Keep them on the experiment computer unless a separate artifact repository

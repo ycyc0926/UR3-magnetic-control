@@ -10,10 +10,9 @@
 |---|---|
 | `config/` | 唯一的系统、标定、工具和场景配置 |
 | `ros2_ws/src/ur3_magnetic_control/` | 正式 ROS 2 Python 包、统一轨迹入口和包内测试 |
-| `robot/` | UR3 文档、只读监控、标定版 MoveIt 启动和离线碰撞工具 |
+| `robot/` | 当前 UR3 启动入口、轨迹说明和通用只读 RTDE 工具 |
 | `camera/` | 相机启动、标定脚本和 H 跟踪入口 |
 | `camera/tracking_sessions/` | 相机原始实验记录，不属于源代码 |
-| `robot/planning_checks/` | 机械臂规划和执行审计记录，不是可直接重放的命令 |
 | `docs/` | 环境说明、历史交接、照片和参考论文 |
 | `vendor/` | 固定版本的第三方 UR ROS 2 驱动源码 |
 
@@ -67,11 +66,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider \
 
 ## 数据保留原则
 
-录像、CSV、RTDE 输出、规划报告和执行报告均保留为实验依据。确认无用前不要按
-文件大小删除它们。可安全清理的内容仅包括 `__pycache__`、`.pytest_cache`、ROS
-构建日志等可重新生成的缓存。
+旧电机和磁铁的规划及执行记录已按要求清理。新的机械臂轨迹结果默认写入
+`~/.local/share/ur3/trajectory_runs/`，避免实验数据再次堆入源码目录；
+`--output` 可显式指定其他位置。相机原始数据仍保存在相机目录。
 
-GitHub 轻量版本只提交源码、配置、说明和小型图片；原始跟踪会话、规划审计数据、
+GitHub 轻量版本只提交源码、配置、说明和小型图片；原始跟踪会话、
 标定原图、论文 PDF、构建输出以及完整第三方驱动快照仅保留在实验电脑。为保证克隆
 后仍可构建，本项目实际修改过的 `ur_calibration` 小型源码包直接保存在
 `ros2_ws/src/ur_calibration/`。

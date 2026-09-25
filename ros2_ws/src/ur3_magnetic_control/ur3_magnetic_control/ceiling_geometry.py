@@ -110,8 +110,8 @@ class CeilingGeometry:
         base_from_root = np.linalg.inv(transforms['base'])
         return {name: base_from_root @ value for name, value in transforms.items()}
 
-    def bounds(self, joints, sphere_xyz, sphere_radius):
-        """Return conservative world-coordinate AABBs for links and sphere."""
+    def bounds(self, joints, magnet_xyz, magnet_radius, magnet_length, magnet_axis):
+        """Return conservative world-coordinate AABBs for links and magnet."""
         transforms = self.transforms(joints)
         result = {}
         for link, offset, kind, shape in self.surfaces:
@@ -131,17 +131,22 @@ class CeilingGeometry:
                 lower = np.minimum(lower, previous_lower)
                 upper = np.maximum(upper, previous_upper)
             result[link] = (np.asarray(lower, dtype=float), np.asarray(upper, dtype=float))
-        sphere = self.world_from_base @ transforms['tool0'] @ np.r_[sphere_xyz, 1.0]
-        result['magnet_sphere_guard'] = (
-            sphere[:3] - sphere_radius,
-            sphere[:3] + sphere_radius,
+        tool = self.world_from_base @ transforms['tool0']
+        center = tool @ np.r_[magnet_xyz, 1.0]
+        axis = tool[:3, :3] @ np.asarray(magnet_axis, dtype=float)
+        half = magnet_radius * np.sqrt(np.maximum(0.0, 1.0 - axis**2)) + magnet_length / 2 * np.abs(axis)
+        result['magnet_cylinder_guard'] = (
+            center[:3] - half,
+            center[:3] + half,
         )
         return result
 
-    def heights(self, joints, sphere_xyz, sphere_radius):
+    def heights(self, joints, magnet_xyz, magnet_radius, magnet_length, magnet_axis):
         return {
             name: float(upper[2])
-            for name, (_, upper) in self.bounds(joints, sphere_xyz, sphere_radius).items()
+            for name, (_, upper) in self.bounds(
+                joints, magnet_xyz, magnet_radius, magnet_length, magnet_axis
+            ).items()
         }
 
 

@@ -3,3 +3,20 @@ xdg-open 'http://127.0.0.1:8767/'
 如果页面提示无法连接，先启动相机服务：
 bash /home/yc/UR3/camera/start_h_tracking.sh
 保持该终端运行，再执行打开网页的命令。
+
+机械臂：
+终端 1：启动驱动和 MoveIt，保持运行
+source /home/yc/UR3/ros2_env.sh && ros2 launch /home/yc/UR3/robot/motion_stack.launch.py
+
+示教器播放 External Control 后，
+
+终端 2：发送移动
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148 --execute
+
+新工具末端 Z 轴垂直桌面时的正方形（先只规划）：
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 138 198 --size-mm 100 --motor-axis-parallel z --axis-alignment-phase before
+
+新工具末端 Z 轴平行桌面时的正方形（先只规划）：
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 113 173 --size-mm 50 --tool-z-parallel-table --tool-z-heading-deg 60 --planning-chunk-mm 50
+
+这两个中心坐标仅在磁铁当前位于 (88, 148) mm 时对应左下角起点；旧工具的可达性结果不适用于新工具。

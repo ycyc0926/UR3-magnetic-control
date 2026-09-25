@@ -1,8 +1,0 @@
-# Absolute magnet-centre targets in the calibrated table_world frame.
-# Units are millimetres. This file is an input example, not an authorized path.
-frame: table_world
-waypoints_mm:
-  - [120.0, 0.0, 350.0]
-  - [140.0, 0.0, 350.0]
-  - [140.0, 20.0, 345.0]
-  - [120.0, 20.0, 345.0]

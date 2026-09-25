@@ -20,15 +20,14 @@ import yaml
 
 from ur3_magnetic_control.acrylic_ceiling_guard import load_guard_configuration
 from ur3_magnetic_control.magnet_trajectory import (
-    EXECUTION_TOKEN,
     JOINT_NAMES,
     MAX_CARTESIAN_STEP_M,
     MagnetPathGeometry,
     MagnetTrajectoryNode,
-    build_trajectory_trace,
     build_circle_targets,
     build_point_targets,
     build_square_targets,
+    horizontal_tool_z_target_rotation,
     concatenate_joint_trajectories,
     joint_state_sample_time,
     load_waypoint_targets,
@@ -36,12 +35,16 @@ from ur3_magnetic_control.magnet_trajectory import (
     ordered_waypoint_matches,
     orientation_path_distance,
     parallel_axis_target_rotation,
+    parse_arguments,
     plot_trajectory,
     point_polyline_distance,
+    requested_targets,
     requested_route_from_plan,
+    resolve_target_height,
     robot_state_after_trajectory,
     sample_pose_guard_path,
     subdivide_route,
+    table_parallel_target_rotation,
     trace_from_jsonl,
     validate_route,
 )
@@ -62,6 +65,18 @@ class TargetGenerationTests(unittest.TestCase):
         np.testing.assert_allclose(points, [[0.125, 0.030, 0.450]])
         self.assertEqual(metadata["shape"], "point")
 
+    def test_xy_target_keeps_current_height_and_defaults_to_ten_mm_s(self):
+        parsed = parse_arguments(["point", "--target-xy-mm", "88", "148"])
+        self.assertEqual(parsed.speed_mm_s, 10.0)
+        targets, metadata = requested_targets(parsed)
+        np.testing.assert_allclose(resolve_target_height(targets, 0.4),
+                                   [[0.088, 0.148, 0.4]])
+        self.assertEqual(metadata["height"], "current_magnet_z")
+        for speed in (4.9, 20.1):
+            with self.subTest(speed=speed), self.assertRaisesRegex(SystemExit, r"\[5, 20\]"):
+                main(["point", "--target-xy-mm", "88", "148",
+                      "--speed-mm-s", str(speed)])
+
     def test_square_is_closed_and_has_requested_geometry(self):
         points, metadata = build_square_targets(
             [100.0, 200.0, 300.0], 20.0, rotation_deg=31.0
@@ -74,6 +89,33 @@ class TargetGenerationTests(unittest.TestCase):
             np.linalg.norm(np.diff(values, axis=0), axis=1), 0.020
         )
         self.assertEqual(metadata["rotation_deg"], 31.0)
+
+    def test_square_uses_current_height_and_levels_tool_z_before_motion(self):
+        parsed = parse_arguments([
+            "square", "--center-xy-mm", "138", "198", "--size-mm", "100",
+        ])
+        self.assertEqual((parsed.motor_axis_parallel, parsed.axis_alignment_phase),
+                         ("tool-z-table", "before"))
+        self.assertEqual(parsed.table_yaw_deg, 0.0)
+        self.assertEqual(parse_arguments([
+            "square", "--center-xy-mm", "138", "198", "--size-mm", "100",
+            "--table-yaw-deg", "180",
+        ]).table_yaw_deg, 180.0)
+        targets, _ = requested_targets(parsed)
+        np.testing.assert_allclose(
+            resolve_target_height(targets, 0.4),
+            [[0.088, 0.148, 0.4], [0.188, 0.148, 0.4],
+             [0.188, 0.248, 0.4], [0.088, 0.248, 0.4],
+             [0.088, 0.148, 0.4]],
+        )
+        horizontal = parse_arguments([
+            "square", "--center-xy-mm", "138", "198", "--size-mm", "100",
+            "--tool-z-parallel-table", "--tool-z-heading-deg", "55",
+            "--axis-roll-deg", "125",
+        ])
+        self.assertEqual(horizontal.motor_axis_parallel, "tool-z-table")
+        self.assertEqual(horizontal.tool_z_heading_deg, 55.0)
+        self.assertEqual(horizontal.motor_axis_roll_deg, 125.0)
 
     def test_clockwise_square_reverses_signed_area(self):
         counterclockwise, _ = build_square_targets([0, 0, 100], 10)
@@ -110,6 +152,25 @@ class TargetGenerationTests(unittest.TestCase):
 
 
 class MotorAxisOrientationTests(unittest.TestCase):
+    def test_tool_z_can_point_horizontally(self):
+        start = Rotation.from_euler("xyz", [20, -12, 33], degrees=True).as_matrix()
+        aligned = horizontal_tool_z_target_rotation(start, 55, 125)
+        axis = aligned["rotation_world_tool"][:, 2]
+        np.testing.assert_allclose(axis, [math.cos(math.radians(55)),
+                                         math.sin(math.radians(55)), 0], atol=1e-12)
+        with self.assertRaisesRegex(ValueError, "heading and axis roll"):
+            horizontal_tool_z_target_rotation(start, 181, 0)
+
+    def test_level_tool_plane_also_levels_motor_axis(self):
+        start = Rotation.from_euler("xyz", [71, -28, 13], degrees=True).as_matrix()
+        aligned = table_parallel_target_rotation(start, [0, -1, 0], yaw_deg=180)
+        result = aligned["rotation_world_tool"]
+        self.assertAlmostEqual(abs(result[2, 2]), 1.0, places=12)
+        self.assertAlmostEqual((result @ [0, -1, 0])[2], 0.0, places=12)
+        self.assertEqual(aligned["table_yaw_deg"], 180.0)
+        with self.assertRaisesRegex(ValueError, "table yaw"):
+            table_parallel_target_rotation(start, [0, -1, 0], yaw_deg=181)
+
     def test_nearest_y_direction_uses_minimum_rotation(self):
         # tool -Y initially points mostly toward world +Z and somewhat -Y,
         # matching the sign-selection case used by the live robot.
@@ -338,29 +399,53 @@ class SavedTraceTests(unittest.TestCase):
 
 
 class ExecutionGateTests(unittest.TestCase):
-    def test_execution_requires_fresh_onsite_confirmations_before_ros_init(self):
-        with self.assertRaisesRegex(SystemExit, "fresh onsite confirmations"):
-            main([
-                "point",
-                "--target-mm", "1", "2", "300",
-                "--execute",
-                "--confirmation-token", EXECUTION_TOKEN,
-                "--accept-provisional-tool-envelope",
-                "--motor-stopped",
-            ])
-
-    def test_execution_requires_provisional_envelope_acknowledgement(self):
-        with self.assertRaisesRegex(SystemExit, "provisional"):
-            main([
-                "point",
-                "--target-mm", "1", "2", "300",
-                "--execute",
-                "--confirmation-token", EXECUTION_TOKEN,
-                "--motor-stopped",
-                "--onsite-clearance-confirmed",
-                "--sole-operator-confirmed",
-                "--external-control-only-confirmed",
-            ])
+    def test_live_monitor_records_motion_and_propagates_boundary_failure(self):
+        checked = {"magnet_world_mm": [100.0, 20.0, 300.0]}
+        geometry = SimpleNamespace(inspect=lambda names, positions: checked)
+        message = JointState(name=list(JOINT_NAMES), position=[100.0] * 6)
+        runner = SimpleNamespace(
+            robot_program_running=True,
+            joint_state_received_at=time.monotonic(),
+            latest_joint_state=message,
+            last_logged_state_time=None,
+            geometry=geometry,
+            actual_samples=[],
+            actual_stream=None,
+            recording_error=None,
+            get_logger=lambda: SimpleNamespace(warning=lambda message: None),
+            table_parallel_start_world=None,
+            table_parallel_mode=None,
+            table_parallel_ready=False,
+        )
+        MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
+        self.assertEqual(runner.actual_samples[0]["magnet_world_mm"], checked["magnet_world_mm"])
+        self.assertNotIn("magnet_speed_mm_s", runner.actual_samples[0])
+        runner.actual_stream = SimpleNamespace(
+            write=lambda value: (_ for _ in ()).throw(OSError("disk full")),
+            close=lambda: None,
+        )
+        runner.last_logged_state_time = None
+        MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
+        self.assertEqual(runner.recording_error, "disk full")
+        self.assertIsNone(runner.actual_stream)
+        runner.table_parallel_start_world = np.asarray([0.1, 0.02, 0.3])
+        checked.update(magnet_world_mm=[103.0, 20.0, 300.0],
+                       tool_normal_world=[0.0, 1.0, 0.0])
+        runner.last_logged_state_time = None
+        with self.assertRaisesRegex(RuntimeError, "tool0 axis differs"):
+            MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
+        runner.table_parallel_mode = "tool-z-table"
+        checked["tool_normal_world"] = [0.0, 0.0, 1.0]
+        runner.last_logged_state_time = None
+        with self.assertRaisesRegex(RuntimeError, "tool0 axis differs"):
+            MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
+        runner.table_parallel_start_world = None
+        geometry.inspect = lambda names, positions: (_ for _ in ()).throw(
+            RuntimeError("ceiling clearance failed")
+        )
+        runner.last_logged_state_time = None
+        with self.assertRaisesRegex(RuntimeError, "ceiling clearance failed"):
+            MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
 
     def test_dashboard_stop_response_is_verified(self):
         response = SimpleNamespace(success=True, message="Stopped")
@@ -470,8 +555,7 @@ class CurrentGeometryRegressionTests(unittest.TestCase):
             tool_lower=np.asarray(tool["min_xyz_m"], dtype=float),
             tool_upper=np.asarray(tool["max_xyz_m"], dtype=float),
         )
-        system = yaml.safe_load((ROOT / "config/ur3_system.yaml").read_text())
-        geometry = MagnetPathGeometry(description, guard, system)
+        geometry = MagnetPathGeometry(description, guard)
         joints = [
             -1.491387192402975,
             -1.9344733397113245,
@@ -483,7 +567,7 @@ class CurrentGeometryRegressionTests(unittest.TestCase):
         result = geometry.inspect(JOINT_NAMES, joints)
         np.testing.assert_allclose(
             result["magnet_world_mm"],
-            [243.505538, 99.444644, 432.830871],
+            [186.435347, 37.991101, 434.475648],
             atol=1.0e-5,
         )
         required_mm = {
@@ -494,45 +578,16 @@ class CurrentGeometryRegressionTests(unittest.TestCase):
         }
         for boundary, required in required_mm.items():
             self.assertGreaterEqual(result["gaps_mm"][boundary], required)
-
-    def test_workspace_ingress_only_accepts_preexisting_bounded_violation(self):
-        geometry = MagnetPathGeometry.__new__(MagnetPathGeometry)
-        geometry.workspace_lower = np.asarray([-1.0, -1.0, -1.0])
-        geometry.workspace_upper = np.asarray([1.0, 1.0, 1.0])
-        geometry.workspace_ingress_limit = np.zeros(6)
-        with self.assertRaisesRegex(RuntimeError, "workspace-ingress"):
-            geometry.configure_workspace_ingress([0.0, 0.0, 1.2], False)
-        violation = geometry.configure_workspace_ingress(
-            [0.0, 0.0, 1.2], True
-        )
-        np.testing.assert_allclose(violation, [0, 0, 0, 0, 0, 0.2])
-
-    def test_workspace_ingress_cannot_leave_again(self):
-        class FakeGeometry:
-            @staticmethod
-            def inspect(_names, positions, allow_workspace_ingress=False):
-                value = float(positions[0])
-                violation = max(-value, 0.0)
-                return {
-                    "magnet_world_mm": [value * 1000.0, 0.0, 0.0],
-                    "tool_quaternion_world_xyzw": [0.0, 0.0, 0.0, 1.0],
-                    "workspace_outside": violation > 0.0,
-                    "workspace_violation_mm": [violation * 1000.0, 0, 0, 0, 0, 0],
-                }
-
-        trajectory = JointTrajectory(joint_names=["joint"])
-        points = []
-        for timestamp, position in enumerate((-1.0, 1.0, -1.0)):
-            point = JointTrajectoryPoint(positions=[position])
-            set_duration(point.time_from_start, float(timestamp))
-            points.append(point)
-        trajectory.points = points
-        with self.assertRaisesRegex(RuntimeError, "left the workspace"):
-            build_trajectory_trace(
-                trajectory,
-                FakeGeometry(),
-                allow_workspace_ingress=True,
-            )
+        table_limit = geometry.limits["table"]
+        geometry.limits["table"] = result["gaps_mm"]["table"] / 1000.0 - 0.001
+        geometry.inspect(JOINT_NAMES, joints)
+        geometry.limits["table"] = table_limit
+        for boundary in required_mm:
+            original = geometry.limits[boundary]
+            geometry.limits[boundary] = result["gaps_mm"][boundary] / 1000.0 + 0.001
+            with self.assertRaisesRegex(RuntimeError, f"{boundary} clearance failed"):
+                geometry.inspect(JOINT_NAMES, joints)
+            geometry.limits[boundary] = original
 
 
 class ControllerInterpolationTests(unittest.TestCase):

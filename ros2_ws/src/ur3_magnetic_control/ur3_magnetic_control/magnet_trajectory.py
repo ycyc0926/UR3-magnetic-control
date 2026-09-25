@@ -4,7 +4,7 @@
 The command accepts absolute magnet-centre coordinates in ``table_world`` and
 keeps the current tool orientation fixed.  It can generate a point move, a
 closed square, a closed circle, or a path loaded from YAML/JSON/CSV.  Planning
-is the default; real execution requires explicit, fresh onsite confirmations.
+is the default; --execute sends motion to the robot.
 
 An optional final motor-axis constraint can rotate the tool about the magnet
 centre and align the verified shaft direction with a selected ``table_world``
@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-from collections import deque
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -53,7 +52,6 @@ from .acrylic_ceiling_guard import AcrylicCeilingGuard, DEFAULT_PROJECT_ROOT
 from .acrylic_geometry import modeled_boundary_gaps_m
 from .cartesian_line_move import (
     CartesianLineMove,
-    EXECUTION_TOKEN,
     duration_seconds,
     set_duration,
 )
@@ -77,28 +75,22 @@ MAX_SEGMENT_M = 0.300
 MAX_TOTAL_PATH_M = 1.000
 MAX_TARGETS = 600
 MAX_DURATION_S = 300.0
-# Independently planned Cartesian chunks intentionally come to rest at every
-# chunk boundary.  A reviewed ingress route can therefore be slower than an
-# ordinary continuous path even though all velocity limits remain unchanged.
+# Independently planned Cartesian chunks come to rest at every chunk boundary.
 MAX_SEGMENTED_DURATION_S = 420.0
 PLANNED_JOINT_SPEED_LIMIT_RAD_S = math.radians(5.0)
 PLANNED_JOINT_ACCELERATION_LIMIT_RAD_S2 = 5.0
-MEASURED_JOINT_SPEED_LIMIT_RAD_S = math.radians(7.0)
 PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S = math.radians(5.0)
-MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S = math.radians(7.0)
-STOPPING_RESERVE_M = 0.002
-LIVE_PATH_TOLERANCE_M = 0.002
 PLANNED_PATH_TOLERANCE_M = 0.00075
 FINAL_POSITION_TOLERANCE_M = 0.00075
 FINAL_AXIS_TOLERANCE_RAD = math.radians(0.25)
 PLANNED_ORIENTATION_PATH_TOLERANCE_RAD = math.radians(0.50)
-LIVE_ORIENTATION_PATH_TOLERANCE_RAD = math.radians(1.0)
+PLANNED_TABLE_TILT_TOLERANCE_RAD = math.radians(0.5)
+LIVE_TABLE_TILT_TOLERANCE_RAD = math.radians(2.0)
 ORIENTATION_WAYPOINT_STEP_RAD = math.radians(1.0)
 POSE_GUARD_POSITION_STEP_M = 0.001
 POSE_GUARD_ORIENTATION_STEP_RAD = math.radians(0.25)
 TRACE_INTERVAL_S = 0.02
 COLLISION_SUBDIVISIONS_PER_SEGMENT = 4
-WORKSPACE_INGRESS_TOLERANCE_M = 0.0001
 MIN_PLANNING_CHUNK_M = 0.002
 MAX_PLANNING_CHUNK_M = 0.050
 
@@ -204,8 +196,7 @@ def parallel_axis_target_rotation(
         )
     angle = float((start.inv() * target).magnitude())
     final_axis = target.as_matrix() @ motor_axis_tool
-    error = math.acos(float(np.clip(np.dot(final_axis, target_axis), -1.0, 1.0)))
-    if error > 1.0e-9:
+    if np.linalg.norm(final_axis - target_axis) > 1.0e-9:
         raise RuntimeError("failed to construct the requested motor-axis rotation")
     return {
         "rotation_world_tool": target.as_matrix(),
@@ -215,6 +206,63 @@ def parallel_axis_target_rotation(
         "roll_deg": roll_deg,
         "rotation_angle_rad": angle,
     }
+
+
+def table_parallel_target_rotation(start_rotation_world, motor_axis_tool, yaw_deg=0.0):
+    """Keep tool0's XY plane level; its tool-frame motor axis then stays level."""
+    start = Rotation.from_matrix(np.asarray(start_rotation_world, dtype=float))
+    motor_axis_tool = normalized_vector(motor_axis_tool, "motor axis in tool")
+    if abs(motor_axis_tool[2]) > 1.0e-6:
+        raise ValueError("motor axis must lie in the tool0 XY plane")
+    normal = start.as_matrix()[:, 2]
+    target_normal = np.asarray([0.0, 0.0, 1.0 if normal[2] >= 0.0 else -1.0])
+    target = rotation_between_vectors(normal, target_normal) * start
+    yaw_deg = float(yaw_deg)
+    if not math.isfinite(yaw_deg) or not -180.0 <= yaw_deg <= 180.0:
+        raise ValueError("table yaw must be within [-180, 180] degrees")
+    if yaw_deg:
+        target = Rotation.from_rotvec([0.0, 0.0, math.radians(yaw_deg)]) * target
+    return {
+        "rotation_world_tool": target.as_matrix(),
+        "current_axis_world": start.as_matrix() @ motor_axis_tool,
+        "target_axis_world": target.as_matrix() @ motor_axis_tool,
+        "selected_direction": "positive" if target_normal[2] > 0 else "negative",
+        "roll_deg": 0.0,
+        "table_yaw_deg": yaw_deg,
+        "rotation_angle_rad": float((start.inv() * target).magnitude()),
+    }
+
+
+def table_tilt_rad(checked):
+    return math.acos(float(np.clip(abs(checked["tool_normal_world"][2]), 0.0, 1.0)))
+
+
+def horizontal_tool_z_target_rotation(start_rotation_world, heading_deg, roll_deg):
+    """Point tool0 +Z along a horizontal table heading."""
+    heading_deg, roll_deg = float(heading_deg), float(roll_deg)
+    if not all(math.isfinite(value) and -180.0 <= value <= 180.0
+               for value in (heading_deg, roll_deg)):
+        raise ValueError("tool Z heading and axis roll must be within [-180, 180] degrees")
+    start = Rotation.from_matrix(np.asarray(start_rotation_world, dtype=float))
+    current_axis = start.as_matrix()[:, 2]
+    heading = math.radians(heading_deg)
+    target_axis = np.asarray([math.cos(heading), math.sin(heading), 0.0])
+    target = rotation_between_vectors(current_axis, target_axis) * start
+    if roll_deg:
+        target = Rotation.from_rotvec(target_axis * math.radians(roll_deg)) * target
+    return {
+        "rotation_world_tool": target.as_matrix(),
+        "current_axis_world": current_axis,
+        "target_axis_world": target_axis,
+        "selected_direction": "heading",
+        "roll_deg": roll_deg,
+        "tool_z_heading_deg": heading_deg,
+        "rotation_angle_rad": float((start.inv() * target).magnitude()),
+    }
+
+
+def horizontal_tool_z_error_rad(checked):
+    return math.asin(float(np.clip(abs(checked["tool_normal_world"][2]), 0.0, 1.0)))
 
 
 def interpolate_rotations(start_rotation, target_rotation, maximum_step_rad):
@@ -327,8 +375,18 @@ def build_point_targets(target_mm) -> tuple[list[np.ndarray], dict]:
     return [target], {"shape": "point", "target_world_mm": list(map(float, target_mm))}
 
 
+def resolve_target_height(targets_world, current_z_m):
+    return [
+        finite_point([*target, current_z_m] if len(target) == 2 else target,
+                     f"target {index}")
+        for index, target in enumerate(targets_world)
+    ]
+
+
 def build_square_targets(center_mm, size_mm, rotation_deg=0.0, clockwise=False):
-    center = finite_point(center_mm, "square center") / 1000.0
+    xy_only = len(center_mm) == 2
+    center = finite_point([*center_mm, 0.0] if xy_only else center_mm,
+                          "square center") / 1000.0
     size = float(size_mm) / 1000.0
     angle = float(rotation_deg)
     if not math.isfinite(size) or not 0.001 <= size <= 0.300:
@@ -345,9 +403,12 @@ def build_square_targets(center_mm, size_mm, rotation_deg=0.0, clockwise=False):
     for value in [*xy, xy[0]]:
         offset = rotation @ np.asarray(value)
         points.append(center + [offset[0], offset[1], 0.0])
+    if xy_only:
+        points = [point[:2] for point in points]
     return points, {
         "shape": "square",
-        "center_world_mm": list(map(float, center_mm)),
+        "center_world_xy_mm" if xy_only else "center_world_mm": list(map(float, center_mm)),
+        **({"height": "current_magnet_z"} if xy_only else {}),
         "size_mm": float(size_mm),
         "rotation_deg": angle,
         "clockwise": bool(clockwise),
@@ -677,9 +738,12 @@ class FullToolGuard(AcrylicCeilingGuard):
         if np.any(self.tool_upper <= self.tool_lower):
             raise ValueError("invalid complete-tool envelope")
         tcp = np.asarray(self.configuration["magnet_tcp_xyz_m"], dtype=float)
-        radius = float(self.configuration["magnet_sphere_radius_m"])
-        if np.any(tcp - radius < self.tool_lower) or np.any(tcp + radius > self.tool_upper):
-            raise ValueError("complete-tool envelope does not contain the magnetic sphere")
+        radius = float(self.configuration["magnet_swept_radius_m"])
+        length = float(self.configuration["magnet_swept_length_m"])
+        axis = np.asarray(self.configuration["motor_axis_tool_vector"], dtype=float)
+        half = radius * np.sqrt(np.maximum(0.0, 1.0 - axis**2)) + length / 2 * np.abs(axis)
+        if np.any(tcp - half < self.tool_lower) or np.any(tcp + half > self.tool_upper):
+            raise ValueError("complete-tool envelope does not contain the magnetic cylinder")
         self.provisional = (
             self.tool_data.get("status") != "complete_verified"
             or envelope.get("verified_encloses_all_rigid_parts") is not True
@@ -755,7 +819,7 @@ class FullToolGuard(AcrylicCeilingGuard):
 class MagnetPathGeometry:
     """Independent world-plane and complete-tool checks for joint states."""
 
-    def __init__(self, robot_description, guard: FullToolGuard, system):
+    def __init__(self, robot_description, guard: FullToolGuard):
         if not robot_description:
             raise ValueError("robot_description is unavailable")
         configuration = guard.configuration
@@ -772,7 +836,9 @@ class MagnetPathGeometry:
             configuration["motor_axis_tool_vector"],
             "motor axis in tool",
         )
-        self.radius = float(configuration["magnet_sphere_radius_m"])
+        self.radius = float(configuration["magnet_swept_radius_m"])
+        self.magnet_length = float(configuration["magnet_swept_length_m"])
+        self.magnet_axis_tool = np.asarray(configuration["motor_axis_tool_vector"], dtype=float)
         self.tool_corners = np.asarray(
             [[x, y, z]
              for x in (guard.tool_lower[0], guard.tool_upper[0])
@@ -781,37 +847,8 @@ class MagnetPathGeometry:
             dtype=float,
         )
         self.limits = load_clearance_limits_m(project_root())
-        workspace = system["safety"]["workspace_bounds_m"]
-        self.workspace_lower = np.asarray(
-            [workspace[key][0] for key in ("x", "y", "z")], dtype=float
-        )
-        self.workspace_upper = np.asarray(
-            [workspace[key][1] for key in ("x", "y", "z")], dtype=float
-        )
-        if (not np.isfinite([self.workspace_lower, self.workspace_upper]).all()
-                or np.any(self.workspace_upper <= self.workspace_lower)):
-            raise ValueError("invalid base-frame workspace bounds")
-        self.workspace_ingress_limit = np.zeros(6, dtype=float)
-        self.reference_rotation_world = None
 
-    def workspace_violation(self, point):
-        point = finite_point(point, "workspace point")
-        return np.r_[
-            np.maximum(self.workspace_lower - point, 0.0),
-            np.maximum(point - self.workspace_upper, 0.0),
-        ]
-
-    def configure_workspace_ingress(self, start_magnet_base, allowed):
-        violation = self.workspace_violation(start_magnet_base)
-        if np.any(violation > 0.0) and not allowed:
-            raise RuntimeError(
-                "current magnet centre is outside the configured workspace; "
-                "a reviewed ingress path requires --allow-workspace-ingress"
-            )
-        self.workspace_ingress_limit = violation if allowed else np.zeros(6)
-        return violation
-
-    def inspect(self, names, positions, allow_workspace_ingress=False):
+    def inspect(self, names, positions):
         positions = np.asarray(positions, dtype=float)
         if len(names) != len(positions) or not np.isfinite(positions).all():
             raise RuntimeError("invalid joint state for geometry inspection")
@@ -832,23 +869,9 @@ class MagnetPathGeometry:
             rotation_world_tool
         ).as_quat()
 
-        workspace_violation = self.workspace_violation(magnet_base)
-        workspace_outside = bool(np.any(workspace_violation > 1.0e-9))
-        ingress_is_bounded = (
-            allow_workspace_ingress
-            and np.all(
-                workspace_violation
-                <= self.workspace_ingress_limit
-                + WORKSPACE_INGRESS_TOLERANCE_M
-            )
+        bounds = self.model.bounds(
+            joints, self.offset, self.radius, self.magnet_length, self.magnet_axis_tool
         )
-        if workspace_outside and not ingress_is_bounded:
-            raise RuntimeError(
-                "magnet centre left configured base-frame workspace: "
-                f"{(magnet_base * 1000.0).round(3).tolist()} mm"
-            )
-
-        bounds = self.model.bounds(joints, self.offset, self.radius)
         tool_points = (
             self.tool_corners @ tool_world[:3, :3].T + tool_world[:3, 3]
         )
@@ -861,38 +884,24 @@ class MagnetPathGeometry:
                     minima[boundary] = (float(gap), geometry_name)
 
         for boundary, (gap, geometry_name) in minima.items():
-            required = self.limits[boundary] + STOPPING_RESERVE_M
+            required = self.limits[boundary]
             if gap + 1.0e-9 < required:
                 raise RuntimeError(
                     f"{boundary} clearance failed at {geometry_name}: "
                     f"gap={gap * 1000.0:.3f} mm, "
-                    f"required={required * 1000.0:.3f} mm "
-                    "(global policy plus 2 mm execution reserve)"
-                )
-
-        orientation_change = 0.0
-        if self.reference_rotation_world is not None:
-            orientation_change = float(
-                (Rotation.from_matrix(self.reference_rotation_world).inv()
-                 * Rotation.from_matrix(rotation_world_tool)).magnitude()
-            )
-            if orientation_change > math.radians(0.25):
-                raise RuntimeError(
-                    "fixed tool orientation departed by more than 0.25 degrees"
+                    f"required={required * 1000.0:.3f} mm"
                 )
 
         return {
             "magnet_world_mm": (magnet_world * 1000.0).tolist(),
             "magnet_base_mm": (magnet_base * 1000.0).tolist(),
             "tool_quaternion_world_xyzw": quaternion_world_tool.tolist(),
+            "tool_normal_world": rotation_world_tool[:, 2].tolist(),
             "motor_axis_world": motor_axis_world.tolist(),
-            "workspace_outside": workspace_outside,
-            "workspace_violation_mm": (workspace_violation * 1000.0).tolist(),
             "gaps_mm": {
                 key: json_number(value[0] * 1000.0) for key, value in minima.items()
             },
             "limiting_geometry": {key: value[1] for key, value in minima.items()},
-            "orientation_change_deg": math.degrees(orientation_change),
         }
 
 
@@ -923,11 +932,7 @@ def maximum_trajectory_acceleration(trajectory):
     return maximum
 
 
-def build_trajectory_trace(
-    trajectory,
-    geometry: MagnetPathGeometry,
-    allow_workspace_ingress=False,
-):
+def build_trajectory_trace(trajectory, geometry: MagnetPathGeometry):
     trace = []
     previous_time = None
     previous_q = None
@@ -936,36 +941,8 @@ def build_trajectory_trace(
     maximum_joint_speed = 0.0
     maximum_magnet_speed = 0.0
     maximum_tool_angular_speed = 0.0
-    workspace_entered = False
-    previous_workspace_violation = None
     for timestamp, positions in sample_trajectory(trajectory, TRACE_INTERVAL_S):
-        checked = geometry.inspect(
-            trajectory.joint_names,
-            positions,
-            allow_workspace_ingress=allow_workspace_ingress,
-        )
-        if checked["workspace_outside"]:
-            if workspace_entered:
-                raise RuntimeError(
-                    "planned trajectory left the workspace after entering it"
-                )
-            violation = np.asarray(
-                checked["workspace_violation_mm"], dtype=float
-            )
-            if (
-                previous_workspace_violation is not None
-                and np.any(
-                    violation
-                    > previous_workspace_violation
-                    + WORKSPACE_INGRESS_TOLERANCE_M * 1000.0
-                )
-            ):
-                raise RuntimeError(
-                    "planned workspace-ingress violation is not monotonic"
-                )
-            previous_workspace_violation = violation
-        else:
-            workspace_entered = True
+        checked = geometry.inspect(trajectory.joint_names, positions)
         magnet = np.asarray(checked["magnet_world_mm"], dtype=float) / 1000.0
         rotation = Rotation.from_quat(
             checked["tool_quaternion_world_xyzw"]
@@ -997,8 +974,6 @@ def build_trajectory_trace(
         previous_q = positions
         previous_magnet = magnet
         previous_rotation = rotation
-    if not workspace_entered:
-        raise RuntimeError("planned trajectory never enters the configured workspace")
     return (
         trace,
         maximum_joint_speed,
@@ -1007,84 +982,21 @@ def build_trajectory_trace(
     )
 
 
-class VectorVelocityWindow:
-    def __init__(self, window_s=0.08):
-        self.window_s = float(window_s)
-        self.samples = deque()
-
-    def add(self, timestamp, value):
-        timestamp = float(timestamp)
-        value = np.asarray(value, dtype=float)
-        if self.samples and timestamp <= self.samples[-1][0]:
-            return
-        self.samples.append((timestamp, value.copy()))
-        while self.samples and timestamp - self.samples[0][0] > 0.25:
-            self.samples.popleft()
-
-    def velocity(self):
-        if len(self.samples) < 2:
-            return None
-        end_time, end = self.samples[-1]
-        for start_time, start in reversed(list(self.samples)[:-1]):
-            elapsed = end_time - start_time
-            if elapsed >= self.window_s:
-                return (end - start) / elapsed
-        return None
-
-
-class AngularVelocityWindow:
-    def __init__(self, window_s=0.08):
-        self.window_s = float(window_s)
-        self.samples = deque()
-
-    def add(self, timestamp, quaternion):
-        timestamp = float(timestamp)
-        rotation = Rotation.from_quat(np.asarray(quaternion, dtype=float))
-        if self.samples and timestamp <= self.samples[-1][0]:
-            return
-        self.samples.append((timestamp, rotation))
-        while self.samples and timestamp - self.samples[0][0] > 0.25:
-            self.samples.popleft()
-
-    def speed(self):
-        if len(self.samples) < 2:
-            return None
-        end_time, end = self.samples[-1]
-        for start_time, start in reversed(list(self.samples)[:-1]):
-            elapsed = end_time - start_time
-            if elapsed >= self.window_s:
-                return float((start.inv() * end).magnitude() / elapsed)
-        return None
-
-
 class MagnetTrajectoryNode(CartesianLineMove):
     def __init__(self):
         super().__init__(
             node_name="magnet_trajectory",
             guard_factory=FullToolGuard,
         )
-        root = project_root()
-        with (root / "config" / "ur3_system.yaml").open(encoding="utf-8") as stream:
-            self.system = yaml.safe_load(stream)
         self.geometry = None
-        self.planned_polyline = None
-        self.planned_pose_centres = None
-        self.planned_pose_quaternions = None
         self.target_motor_axis_world = None
+        self.target_tool_z_world = None
+        self.table_parallel_start_world = None
+        self.table_parallel_mode = None
+        self.table_parallel_ready = False
         self.actual_stream = None
         self.actual_samples = []
         self.last_logged_state_time = None
-        self.joint_velocity_window = VectorVelocityWindow()
-        self.magnet_velocity_window = VectorVelocityWindow()
-        self.tool_angular_velocity_window = AngularVelocityWindow()
-        self.allow_workspace_ingress = False
-        self.live_workspace_entered = False
-        self.live_workspace_violation_mm = None
-        self.maximum_live_tcp_speed = float(
-            self.system["safety"]["initial_max_tcp_speed_m_s"]
-        )
-        if not 0.0 < self.maximum_live_tcp_speed <= 0.020:
-            raise ValueError("configured initial TCP speed limit must be in (0, 20] mm/s")
 
     def wait_for_fresh_state(self, timeout=5.0, require_execution_state=False):
         deadline = time.monotonic() + timeout
@@ -1161,20 +1073,21 @@ class MagnetTrajectoryNode(CartesianLineMove):
         self,
         targets_world,
         speed_m_s,
-        allow_workspace_ingress=False,
         planning_chunk_m=None,
         motor_axis_parallel=None,
         motor_axis_direction="nearest",
         motor_axis_roll_deg=0.0,
+        table_yaw_deg=0.0,
+        tool_z_heading_deg=0.0,
         axis_alignment_phase="after",
     ):
         speed_m_s = float(speed_m_s)
-        if not math.isfinite(speed_m_s) or not 0.0001 <= speed_m_s <= 0.020:
-            raise ValueError("magnet speed must be within [0.1, 20] mm/s")
+        if not math.isfinite(speed_m_s) or not 0.005 <= speed_m_s <= 0.020:
+            raise ValueError("magnet speed must be within [5, 20] mm/s")
         if motor_axis_parallel is not None and motor_axis_parallel not in (
-            "x", "y", "z"
+            "x", "y", "z", "table", "tool-z-table"
         ):
-            raise ValueError("motor-axis parallel target must be x, y, or z")
+            raise ValueError("axis parallel target must be x, y, z, table, or tool-z-table")
         if motor_axis_direction not in ("nearest", "positive", "negative"):
             raise ValueError(
                 "motor-axis direction must be nearest, positive, or negative"
@@ -1185,15 +1098,19 @@ class MagnetTrajectoryNode(CartesianLineMove):
             )
         if axis_alignment_phase not in ("before", "after"):
             raise ValueError("axis alignment phase must be before or after")
-        targets_world = [
-            finite_point(point, f"target {index}")
-            for index, point in enumerate(targets_world)
-        ]
-        self.maximum_live_tcp_speed = min(
-            float(self.system["safety"]["initial_max_tcp_speed_m_s"]),
-            max(speed_m_s * 1.10, speed_m_s + 0.0005),
-        )
-        self.allow_workspace_ingress = bool(allow_workspace_ingress)
+        if motor_axis_parallel == "table" and (
+            motor_axis_direction != "nearest" or axis_alignment_phase != "before"
+            or motor_axis_roll_deg != 0.0
+        ):
+            raise ValueError("table-parallel tool requires nearest direction, zero roll and before alignment")
+        if motor_axis_parallel != "table" and table_yaw_deg != 0.0:
+            raise ValueError("table yaw requires table-parallel tool")
+        if motor_axis_parallel == "tool-z-table" and (
+            motor_axis_direction != "nearest" or axis_alignment_phase != "before"
+        ):
+            raise ValueError("horizontal tool Z requires nearest direction and before alignment")
+        if motor_axis_parallel != "tool-z-table" and tool_z_heading_deg != 0.0:
+            raise ValueError("tool Z heading requires horizontal tool Z mode")
         start_state = self.current_robot_state()
         self.ceiling_guard.apply(start_state)
         self.ceiling_guard.validate_state(start_state, "current robot state")
@@ -1211,7 +1128,17 @@ class MagnetTrajectoryNode(CartesianLineMove):
         )
         world_from_base = np.linalg.inv(base_from_world)
         start_magnet_world = homogeneous_point(world_from_base, start_magnet_base)
+        targets_world = resolve_target_height(targets_world, start_magnet_world[2])
+        if (len(targets_world) > 1
+                and np.linalg.norm(targets_world[0] - start_magnet_world) < 0.0005):
+            targets_world = targets_world[1:]
         start_rotation_world = world_from_base[:3, :3] @ rotation_base_tool
+        self.table_parallel_start_world = (
+            start_magnet_world.copy()
+            if motor_axis_parallel in ("table", "tool-z-table") else None
+        )
+        self.table_parallel_mode = motor_axis_parallel
+        self.table_parallel_ready = False
         route, segment_lengths, total_length = validate_route(
             start_magnet_world, targets_world
         )
@@ -1219,70 +1146,42 @@ class MagnetTrajectoryNode(CartesianLineMove):
         axis_alignment = None
         target_rotation_world = None
         if motor_axis_parallel is not None:
-            if not self.ceiling_guard.configuration["motor_axis_verified"]:
+            if (motor_axis_parallel != "tool-z-table"
+                    and not self.ceiling_guard.configuration["motor_axis_verified"]):
                 raise RuntimeError(
                     "motor-axis alignment is blocked because the physical "
                     "shaft direction has not been verified"
                 )
-            axis_alignment = parallel_axis_target_rotation(
-                start_rotation_world,
-                self.ceiling_guard.configuration["motor_axis_tool_vector"],
-                motor_axis_parallel,
-                motor_axis_direction,
-                motor_axis_roll_deg,
-            )
+            if motor_axis_parallel == "tool-z-table":
+                axis_alignment = horizontal_tool_z_target_rotation(
+                    start_rotation_world, tool_z_heading_deg, motor_axis_roll_deg
+                )
+            elif motor_axis_parallel == "table":
+                axis_alignment = table_parallel_target_rotation(
+                    start_rotation_world,
+                    self.ceiling_guard.configuration["motor_axis_tool_vector"],
+                    table_yaw_deg,
+                )
+            else:
+                axis_alignment = parallel_axis_target_rotation(
+                    start_rotation_world,
+                    self.ceiling_guard.configuration["motor_axis_tool_vector"],
+                    motor_axis_parallel,
+                    motor_axis_direction,
+                    motor_axis_roll_deg,
+                )
             target_rotation_world = axis_alignment["rotation_world_tool"]
-            self.target_motor_axis_world = axis_alignment[
-                "target_axis_world"
-            ].copy()
+            self.target_tool_z_world = (
+                axis_alignment["target_axis_world"].copy()
+                if motor_axis_parallel == "tool-z-table" else None
+            )
+            self.target_motor_axis_world = (
+                axis_alignment["target_axis_world"].copy()
+                if motor_axis_parallel != "tool-z-table" else None
+            )
         else:
             self.target_motor_axis_world = None
-
-        workspace = self.system["safety"]["workspace_bounds_m"]
-        workspace_lower = np.asarray(
-            [workspace[key][0] for key in ("x", "y", "z")], dtype=float
-        )
-        workspace_upper = np.asarray(
-            [workspace[key][1] for key in ("x", "y", "z")], dtype=float
-        )
-        start_target_violation = np.r_[
-            np.maximum(workspace_lower - start_magnet_base, 0.0),
-            np.maximum(start_magnet_base - workspace_upper, 0.0),
-        ]
-        previous_target_violation = start_target_violation
-        target_path_entered_workspace = not np.any(
-            start_target_violation > 1.0e-9
-        )
-        for index, magnet_world in enumerate(targets_world):
-            magnet_base = homogeneous_point(base_from_world, magnet_world)
-            target_violation = np.r_[
-                np.maximum(workspace_lower - magnet_base, 0.0),
-                np.maximum(magnet_base - workspace_upper, 0.0),
-            ]
-            target_is_outside = bool(np.any(target_violation > 1.0e-9))
-            if target_is_outside:
-                bounded_ingress_target = (
-                    allow_workspace_ingress
-                    and not target_path_entered_workspace
-                    and np.all(
-                        target_violation
-                        <= start_target_violation
-                        + WORKSPACE_INGRESS_TOLERANCE_M
-                    )
-                    and np.all(
-                        target_violation
-                        <= previous_target_violation
-                        + WORKSPACE_INGRESS_TOLERANCE_M
-                    )
-                )
-                if not bounded_ingress_target:
-                    raise RuntimeError(
-                        f"target {index} is outside the configured base-frame "
-                        f"workspace: {(magnet_base * 1000.0).round(3).tolist()} mm"
-                    )
-            else:
-                target_path_entered_workspace = True
-            previous_target_violation = target_violation
+            self.target_tool_z_world = None
 
         def pose_from_step(step):
             magnet_world = step["magnet_world"]
@@ -1325,7 +1224,7 @@ class MagnetTrajectoryNode(CartesianLineMove):
         orientation_steps = []
         if target_rotation_world is not None and axis_alignment[
             "rotation_angle_rad"
-        ] > 1.0e-8:
+        ] > math.radians(0.05):
             rotation_centre = (
                 route[0] if axis_alignment_phase == "before" else route[-1]
             )
@@ -1451,23 +1350,10 @@ class MagnetTrajectoryNode(CartesianLineMove):
         self.geometry = MagnetPathGeometry(
             self.ceiling_guard.robot_description,
             self.ceiling_guard,
-            self.system,
         )
-        start_workspace_violation = self.geometry.configure_workspace_ingress(
-            start_magnet_base,
-            self.allow_workspace_ingress,
-        )
-        self.geometry.reference_rotation_world = (
-            start_rotation_world if target_rotation_world is None else None
-        )
-        start_checked = self.geometry.inspect(
+        self.geometry.inspect(
             start_state.joint_state.name,
             start_state.joint_state.position,
-            allow_workspace_ingress=self.allow_workspace_ingress,
-        )
-        self.live_workspace_entered = not start_checked["workspace_outside"]
-        self.live_workspace_violation_mm = np.asarray(
-            start_checked["workspace_violation_mm"], dtype=float
         )
 
         original_duration = duration_seconds(trajectory.points[-1].time_from_start)
@@ -1510,7 +1396,6 @@ class MagnetTrajectoryNode(CartesianLineMove):
         ) = build_trajectory_trace(
             trajectory,
             self.geometry,
-            allow_workspace_ingress=self.allow_workspace_ingress,
         )
         additional_scale = max(
             1.0,
@@ -1549,7 +1434,6 @@ class MagnetTrajectoryNode(CartesianLineMove):
             ) = build_trajectory_trace(
                 trajectory,
                 self.geometry,
-                allow_workspace_ingress=self.allow_workspace_ingress,
             )
         if maximum_joint_speed > PLANNED_JOINT_SPEED_LIMIT_RAD_S + 1.0e-9:
             raise RuntimeError(
@@ -1572,6 +1456,15 @@ class MagnetTrajectoryNode(CartesianLineMove):
                 f"limit: {math.degrees(maximum_tool_angular_speed):.6f} deg/s > "
                 f"{math.degrees(PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S):.6f} deg/s"
             )
+        if motor_axis_parallel in ("table", "tool-z-table"):
+            for entry in trace:
+                magnet = np.asarray(entry["magnet_world_mm"]) / 1000.0
+                error = (horizontal_tool_z_error_rad(entry)
+                         if motor_axis_parallel == "tool-z-table"
+                         else table_tilt_rad(entry))
+                if (np.linalg.norm(magnet - start_magnet_world) > 0.001
+                        and error > PLANNED_TABLE_TILT_TOLERANCE_RAD):
+                    raise RuntimeError("planned tool axis is not parallel to the table")
         final_duration = duration_seconds(trajectory.points[-1].time_from_start)
         if final_duration > duration_limit_s:
             raise RuntimeError(
@@ -1650,8 +1543,12 @@ class MagnetTrajectoryNode(CartesianLineMove):
         alignment_report = None
         if axis_alignment is not None:
             target_motor_axis = axis_alignment["target_axis_world"]
+            planned_axis = (
+                normalized_vector(trace[-1]["tool_normal_world"], "planned tool Z")
+                if motor_axis_parallel == "tool-z-table" else final_motor_axis
+            )
             final_axis_error = math.acos(float(np.clip(
-                np.dot(final_motor_axis, target_motor_axis), -1.0, 1.0
+                np.dot(planned_axis, target_motor_axis), -1.0, 1.0
             )))
             if final_axis_error > FINAL_AXIS_TOLERANCE_RAD:
                 raise RuntimeError(
@@ -1663,6 +1560,8 @@ class MagnetTrajectoryNode(CartesianLineMove):
                 "requested_direction": motor_axis_direction,
                 "selected_direction": axis_alignment["selected_direction"],
                 "roll_about_target_axis_deg": axis_alignment["roll_deg"],
+                "table_yaw_deg": axis_alignment.get("table_yaw_deg"),
+                "tool_z_heading_deg": axis_alignment.get("tool_z_heading_deg"),
                 "phase": axis_alignment_phase,
                 "current_axis_world": axis_alignment[
                     "current_axis_world"
@@ -1672,16 +1571,9 @@ class MagnetTrajectoryNode(CartesianLineMove):
                     axis_alignment["rotation_angle_rad"]
                 ),
                 "orientation_waypoint_count": len(orientation_steps),
-                "planned_final_axis_world": final_motor_axis.tolist(),
+                "planned_final_axis_world": planned_axis.tolist(),
                 "planned_final_axis_error_deg": math.degrees(final_axis_error),
             }
-        # Live tracking uses the compact requested route, which was just
-        # proven equivalent to the dense planned trace within the tighter
-        # PLANNED_PATH_TOLERANCE_M.  Scanning the dense time trace in every
-        # joint-state callback can starve ROS feedback processing.
-        self.planned_polyline = intended_polyline.copy()
-        self.planned_pose_centres = pose_centres
-        self.planned_pose_quaternions = pose_quaternions
         collision_samples = self.validate_controller_interpolation(
             trajectory, start_state
         )
@@ -1726,25 +1618,16 @@ class MagnetTrajectoryNode(CartesianLineMove):
                 match["sample_index"] for match in ordered_matches
             ],
             "controller_interpolation_collision_samples": collision_samples,
-            "live_magnet_speed_abort_mm_s": self.maximum_live_tcp_speed * 1000.0,
-            "live_tool_angular_speed_abort_deg_s": math.degrees(
-                MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
-            ),
             "minimum_planned_clearance_mm": minimum_planned_clearance,
-            "workspace_ingress_enabled": self.allow_workspace_ingress,
-            "start_workspace_violation_mm": (
-                start_workspace_violation * 1000.0
-            ).tolist(),
             "final_error_mm": final_error * 1000.0,
         }
 
     def start_actual_recording(self, path: Path):
         self.actual_stream = Path(path).open("x", encoding="utf-8", buffering=1)
+        self.recording_error = None
         self.actual_samples = []
         self.last_logged_state_time = None
-        self.joint_velocity_window = VectorVelocityWindow()
-        self.magnet_velocity_window = VectorVelocityWindow()
-        self.tool_angular_velocity_window = AngularVelocityWindow()
+        self.table_parallel_ready = False
         self.execution_validator = self.monitor_execution_state
 
     def stop_actual_recording(self):
@@ -1768,104 +1651,39 @@ class MagnetTrajectoryNode(CartesianLineMove):
             return
         mapping = dict(zip(message.name, message.position))
         positions = np.asarray([mapping[name] for name in JOINT_NAMES], dtype=float)
-        checked = self.geometry.inspect(
-            JOINT_NAMES,
-            positions,
-            allow_workspace_ingress=self.allow_workspace_ingress,
-        )
-        if checked["workspace_outside"]:
-            if self.live_workspace_entered:
-                raise RuntimeError(
-                    "robot left the workspace after entering it"
-                )
-            violation = np.asarray(
-                checked["workspace_violation_mm"], dtype=float
-            )
-            if (
-                self.live_workspace_violation_mm is not None
-                and np.any(
-                    violation
-                    > self.live_workspace_violation_mm
-                    + WORKSPACE_INGRESS_TOLERANCE_M * 1000.0
-                )
-            ):
-                raise RuntimeError(
-                    "live workspace-ingress violation increased"
-                )
-            self.live_workspace_violation_mm = violation
-        else:
-            self.live_workspace_entered = True
-        magnet = np.asarray(checked["magnet_world_mm"], dtype=float) / 1000.0
-        self.joint_velocity_window.add(sample_time, positions)
-        self.magnet_velocity_window.add(sample_time, magnet)
-        self.tool_angular_velocity_window.add(
-            sample_time, checked["tool_quaternion_world_xyzw"]
-        )
-        joint_velocity = self.joint_velocity_window.velocity()
-        magnet_velocity = self.magnet_velocity_window.velocity()
-        tool_angular_speed = self.tool_angular_velocity_window.speed()
-        joint_speed = 0.0 if joint_velocity is None else float(
-            np.max(np.abs(joint_velocity))
-        )
-        magnet_speed = 0.0 if magnet_velocity is None else float(
-            np.linalg.norm(magnet_velocity)
-        )
-        measured_tool_angular_speed = (
-            0.0 if tool_angular_speed is None else tool_angular_speed
-        )
-        if joint_velocity is not None and joint_speed > MEASURED_JOINT_SPEED_LIMIT_RAD_S:
-            raise RuntimeError(
-                f"measured joint speed exceeded {math.degrees(MEASURED_JOINT_SPEED_LIMIT_RAD_S):.1f} deg/s"
-            )
-        if magnet_velocity is not None and magnet_speed > self.maximum_live_tcp_speed:
-            raise RuntimeError(
-                f"measured magnet-centre speed exceeded "
-                f"{self.maximum_live_tcp_speed * 1000.0:.1f} mm/s"
-            )
-        if (
-            tool_angular_speed is not None
-            and tool_angular_speed > MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
-        ):
-            raise RuntimeError(
-                "measured tool angular speed exceeded "
-                f"{math.degrees(MEASURED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S):.1f} deg/s"
-            )
-        path_error = point_polyline_distance(magnet, self.planned_polyline)
-        if path_error > LIVE_PATH_TOLERANCE_M:
-            raise RuntimeError(
-                f"magnet centre departed planned path by {path_error * 1000.0:.3f} mm"
-            )
-        orientation_path_error = orientation_path_distance(
-            magnet,
-            checked["tool_quaternion_world_xyzw"],
-            self.planned_pose_centres,
-            self.planned_pose_quaternions,
-            LIVE_PATH_TOLERANCE_M + POSE_GUARD_POSITION_STEP_M,
-        )
-        if orientation_path_error > LIVE_ORIENTATION_PATH_TOLERANCE_RAD:
-            raise RuntimeError(
-                "tool orientation departed planned pose path by "
-                f"{math.degrees(orientation_path_error):.3f} deg"
-            )
+        checked = self.geometry.inspect(JOINT_NAMES, positions)
+        if self.table_parallel_start_world is not None:
+            tilt = (horizontal_tool_z_error_rad(checked)
+                    if self.table_parallel_mode == "tool-z-table"
+                    else table_tilt_rad(checked))
+            magnet = np.asarray(checked["magnet_world_mm"]) / 1000.0
+            if tilt <= math.radians(1.0):
+                self.table_parallel_ready = True
+            elif (self.table_parallel_ready
+                  or np.linalg.norm(magnet - self.table_parallel_start_world) > 0.001):
+                if tilt > LIVE_TABLE_TILT_TOLERANCE_RAD:
+                    raise RuntimeError(
+                        f"tool0 axis differs from table parallel by {math.degrees(tilt):.2f} degrees"
+                    )
         entry = {
             "host_time_ns": time.time_ns(),
             "monotonic_s": received,
             "joint_state_stamp_s": sample_time,
             "q_rad": positions.tolist(),
-            "joint_speed_deg_s": math.degrees(joint_speed),
-            "magnet_speed_mm_s": magnet_speed * 1000.0,
-            "tool_angular_speed_deg_s": math.degrees(
-                measured_tool_angular_speed
-            ),
-            "path_error_mm": path_error * 1000.0,
-            "orientation_path_error_deg": math.degrees(
-                orientation_path_error
-            ),
             **checked,
         }
         self.actual_samples.append(entry)
         if self.actual_stream is not None:
-            self.actual_stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
+            try:
+                self.actual_stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
+            except OSError as error:
+                self.recording_error = str(error)
+                self.get_logger().warning(f"trajectory recording stopped: {error}")
+                stream, self.actual_stream = self.actual_stream, None
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         self.last_logged_state_time = sample_time
 
 
@@ -1994,14 +1812,22 @@ def plot_trajectory(input_path: Path, output_path: Path):
 
 
 def add_motion_arguments(parser):
-    parser.add_argument("--speed-mm-s", type=float, default=5.0)
-    parser.add_argument(
+    parser.add_argument("--speed-mm-s", type=float, default=10.0)
+    axis_group = parser.add_mutually_exclusive_group()
+    axis_group.add_argument(
         "--motor-axis-parallel",
-        choices=("x", "y", "z"),
+        choices=("x", "y", "z", "table"),
         help=(
-            "at the final pose, make the verified motor shaft parallel to "
-            "this table_world axis"
+            "align the motor shaft to a table_world axis, or keep the tool0 "
+            "XY plane parallel to the table"
         ),
+    )
+    axis_group.add_argument(
+        "--tool-z-parallel-table",
+        dest="motor_axis_parallel",
+        action="store_const",
+        const="tool-z-table",
+        help="keep tool0 +Z parallel to the table during translation",
     )
     parser.add_argument(
         "--motor-axis-direction",
@@ -2013,13 +1839,23 @@ def add_motion_arguments(parser):
         ),
     )
     parser.add_argument(
-        "--motor-axis-roll-deg",
+        "--motor-axis-roll-deg", "--axis-roll-deg",
         type=float,
         default=0.0,
         help=(
-            "remaining roll about the selected world axis after alignment; "
+            "remaining roll about the selected target axis after alignment; "
             "useful for choosing a reachable wrist posture (default: 0)"
         ),
+    )
+    parser.add_argument(
+        "--table-yaw-deg",
+        type=float,
+        default=0.0,
+        help="rotate around the table normal after leveling tool0 (default: 0)",
+    )
+    parser.add_argument(
+        "--tool-z-heading-deg", type=float, default=0.0,
+        help="horizontal tool0 +Z heading in table_world XY, measured from +X",
     )
     parser.add_argument(
         "--axis-alignment-phase",
@@ -2040,24 +1876,6 @@ def add_motion_arguments(parser):
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--confirmation-token", default="")
-    parser.add_argument(
-        "--accept-provisional-tool-envelope",
-        action="store_true",
-        help="acknowledge that bracket/cable geometry is not fully measured",
-    )
-    parser.add_argument("--motor-stopped", action="store_true")
-    parser.add_argument("--onsite-clearance-confirmed", action="store_true")
-    parser.add_argument("--sole-operator-confirmed", action="store_true")
-    parser.add_argument("--external-control-only-confirmed", action="store_true")
-    parser.add_argument(
-        "--allow-workspace-ingress",
-        action="store_true",
-        help=(
-            "allow only a bounded, monotonic recovery from an already "
-            "out-of-workspace start"
-        ),
-    )
 
 
 def parse_arguments(arguments):
@@ -2065,17 +1883,26 @@ def parse_arguments(arguments):
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     point = subparsers.add_parser("point", help="move magnet centre to one point")
-    point.add_argument("--target-mm", nargs=3, type=float, required=True,
-                       metavar=("X", "Y", "Z"))
+    point_target = point.add_mutually_exclusive_group(required=True)
+    point_target.add_argument("--target-mm", nargs=3, type=float,
+                              metavar=("X", "Y", "Z"))
+    point_target.add_argument("--target-xy-mm", nargs=2, type=float,
+                              metavar=("X", "Y"),
+                              help="keep the current magnet-centre Z height")
     add_motion_arguments(point)
 
     square = subparsers.add_parser("square", help="trace a closed XY square")
-    square.add_argument("--center-mm", nargs=3, type=float, required=True,
-                        metavar=("X", "Y", "Z"))
+    square_center = square.add_mutually_exclusive_group(required=True)
+    square_center.add_argument("--center-mm", nargs=3, type=float,
+                               metavar=("X", "Y", "Z"))
+    square_center.add_argument("--center-xy-mm", nargs=2, type=float,
+                               metavar=("X", "Y"),
+                               help="keep the current magnet-centre Z height")
     square.add_argument("--size-mm", type=float, required=True)
     square.add_argument("--rotation-deg", type=float, default=0.0)
     square.add_argument("--clockwise", action="store_true")
     add_motion_arguments(square)
+    square.set_defaults(motor_axis_parallel="tool-z-table", axis_alignment_phase="before")
 
     circle = subparsers.add_parser("circle", help="trace a closed XY circle")
     circle.add_argument("--center-mm", nargs=3, type=float, required=True,
@@ -2098,10 +1925,19 @@ def parse_arguments(arguments):
 
 def requested_targets(arguments):
     if arguments.command == "point":
+        if arguments.target_xy_mm is not None:
+            xy = np.asarray(arguments.target_xy_mm, dtype=float)
+            if not np.isfinite(xy).all():
+                raise ValueError("target XY must be finite")
+            return [xy / 1000.0], {
+                "shape": "point", "target_world_xy_mm": xy.tolist(),
+                "height": "current_magnet_z",
+            }
         return build_point_targets(arguments.target_mm)
     if arguments.command == "square":
         return build_square_targets(
-            arguments.center_mm,
+            arguments.center_xy_mm if arguments.center_xy_mm is not None
+            else arguments.center_mm,
             arguments.size_mm,
             arguments.rotation_deg,
             arguments.clockwise,
@@ -2121,7 +1957,8 @@ def requested_targets(arguments):
 
 def default_output_directory(command):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return project_root() / "robot" / "trajectory_runs" / f"{stamp}_{command}"
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    return data_home / "ur3" / "trajectory_runs" / f"{stamp}_{command}"
 
 
 def trajectory_points_for_report(trajectory):
@@ -2146,8 +1983,8 @@ def main(args=None):
         print(result)
         return
 
-    if not math.isfinite(parsed.speed_mm_s) or not 0.1 <= parsed.speed_mm_s <= 20.0:
-        raise SystemExit("speed must be within [0.1, 20] mm/s")
+    if not math.isfinite(parsed.speed_mm_s) or not 5.0 <= parsed.speed_mm_s <= 20.0:
+        raise SystemExit("speed must be within [5, 20] mm/s")
     if parsed.planning_chunk_mm is not None and (
         not math.isfinite(parsed.planning_chunk_mm)
         or not MIN_PLANNING_CHUNK_M * 1000.0
@@ -2174,28 +2011,25 @@ def main(args=None):
         or not -180.0 <= parsed.motor_axis_roll_deg <= 180.0
     ):
         raise SystemExit("motor-axis roll must be within [-180, 180] degrees")
-    if parsed.execute and parsed.confirmation_token != EXECUTION_TOKEN:
-        raise SystemExit("execution refused: confirmation token is missing or invalid")
-    if parsed.execute and not parsed.accept_provisional_tool_envelope:
-        raise SystemExit(
-            "execution refused: current complete-tool envelope is provisional; "
-            "pass --accept-provisional-tool-envelope only after onsite verification"
-        )
-    execution_confirmations = {
-        "motor_stopped": parsed.motor_stopped,
-        "onsite_clearance_confirmed": parsed.onsite_clearance_confirmed,
-        "sole_operator_confirmed": parsed.sole_operator_confirmed,
-        "external_control_only_confirmed": parsed.external_control_only_confirmed,
-    }
-    if parsed.execute and not all(execution_confirmations.values()):
-        missing = [
-            name for name, confirmed in execution_confirmations.items()
-            if not confirmed
-        ]
-        raise SystemExit(
-            "execution refused: fresh onsite confirmations are missing: "
-            + ", ".join(missing)
-        )
+    if parsed.motor_axis_parallel == "table" and (
+        parsed.motor_axis_direction != "nearest"
+        or parsed.axis_alignment_phase != "before"
+        or parsed.motor_axis_roll_deg != 0.0
+    ):
+        raise SystemExit("table-parallel tool requires nearest direction, zero roll and before alignment")
+    if not math.isfinite(parsed.table_yaw_deg) or not -180.0 <= parsed.table_yaw_deg <= 180.0:
+        raise SystemExit("table yaw must be within [-180, 180] degrees")
+    if parsed.motor_axis_parallel != "table" and parsed.table_yaw_deg != 0.0:
+        raise SystemExit("table yaw requires table-parallel tool")
+    if parsed.motor_axis_parallel == "tool-z-table" and (
+        parsed.motor_axis_direction != "nearest"
+        or parsed.axis_alignment_phase != "before"
+    ):
+        raise SystemExit("horizontal tool Z requires nearest direction and before alignment")
+    if not math.isfinite(parsed.tool_z_heading_deg) or not -180.0 <= parsed.tool_z_heading_deg <= 180.0:
+        raise SystemExit("tool Z heading must be within [-180, 180] degrees")
+    if parsed.motor_axis_parallel != "tool-z-table" and parsed.tool_z_heading_deg != 0.0:
+        raise SystemExit("tool Z heading requires --tool-z-parallel-table")
     try:
         targets, shape = requested_targets(parsed)
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -2219,11 +2053,11 @@ def main(args=None):
         "requested_motor_axis_parallel": parsed.motor_axis_parallel,
         "requested_motor_axis_direction": parsed.motor_axis_direction,
         "requested_motor_axis_roll_deg": float(parsed.motor_axis_roll_deg),
+        "requested_table_yaw_deg": float(parsed.table_yaw_deg),
+        "requested_tool_z_heading_deg": float(parsed.tool_z_heading_deg),
         "requested_axis_alignment_phase": parsed.axis_alignment_phase,
         "execute_requested": bool(parsed.execute),
-        "execution_confirmations": execution_confirmations,
         "controls_motor": False,
-        "workspace_ingress_requested": bool(parsed.allow_workspace_ingress),
         "planning_chunk_requested_mm": parsed.planning_chunk_mm,
         "motion_sent": False,
         "execution_allowed_by_file": False,
@@ -2232,7 +2066,6 @@ def main(args=None):
         "global_clearance_mm": {
             key: value * 1000.0 for key, value in load_clearance_limits_m(root).items()
         },
-        "additional_execution_reserve_mm": STOPPING_RESERVE_M * 1000.0,
         "limitations": [
             "application-level guard; not a certified safety function",
             "complete rigid tool envelope is provisional",
@@ -2262,7 +2095,6 @@ def main(args=None):
         planning = node.plan_magnet_targets(
             targets,
             parsed.speed_mm_s / 1000.0,
-            allow_workspace_ingress=parsed.allow_workspace_ingress,
             planning_chunk_m=(
                 None
                 if parsed.planning_chunk_mm is None
@@ -2271,8 +2103,11 @@ def main(args=None):
             motor_axis_parallel=parsed.motor_axis_parallel,
             motor_axis_direction=parsed.motor_axis_direction,
             motor_axis_roll_deg=parsed.motor_axis_roll_deg,
+            table_yaw_deg=parsed.table_yaw_deg,
+            tool_z_heading_deg=parsed.tool_z_heading_deg,
             axis_alignment_phase=parsed.axis_alignment_phase,
         )
+        targets = [np.asarray(point) for point in planning["targets_world_m"]]
         trajectory = planning.pop("solution")
         planning.pop("start_state")
         planned_trace = planning.pop("planned_trace")
@@ -2287,9 +2122,6 @@ def main(args=None):
             joint_names=list(trajectory.joint_trajectory.joint_names),
             trajectory_points=trajectory_points_for_report(
                 trajectory.joint_trajectory
-            ),
-            provisional_tool_envelope_accepted_for_execution=bool(
-                parsed.accept_provisional_tool_envelope
             ),
         )
         # Keep the trace at top level so the plotting command can consume a
@@ -2319,18 +2151,33 @@ def main(args=None):
         if planning["motor_axis_alignment"] is not None:
             alignment = planning["motor_axis_alignment"]
             print(
-                "FINAL_MOTOR_AXIS_WORLD="
+                ("FINAL_TOOL_Z_WORLD=" if alignment["world_axis"] == "tool-z-table"
+                 else "FINAL_MOTOR_AXIS_WORLD=")
                 + ",".join(
                     f"{value:.6f}"
                     for value in alignment["planned_final_axis_world"]
                 )
             )
+            axis_label = (
+                "tool0_z_parallel_table" if alignment["world_axis"] == "tool-z-table"
+                else "tool0_plane_parallel_table" if alignment["world_axis"] == "table"
+                else f"table_world_{alignment['selected_direction']}"
+                     f"{alignment['world_axis'].upper()}"
+            )
+            yaw_label = (
+                f"yaw={alignment['table_yaw_deg']:.3f}deg "
+                if alignment["world_axis"] == "table" else ""
+            )
+            heading_label = (
+                f"heading={alignment['tool_z_heading_deg']:.3f}deg "
+                if alignment["world_axis"] == "tool-z-table" else ""
+            )
             print(
-                "AXIS_ALIGNMENT="
-                f"table_world_{alignment['selected_direction']}"
-                f"{alignment['world_axis'].upper()} "
+                f"AXIS_ALIGNMENT={axis_label} "
                 f"rotation={alignment['minimum_rotation_deg']:.3f}deg "
                 f"roll={alignment['roll_about_target_axis_deg']:.3f}deg "
+                f"{yaw_label}"
+                f"{heading_label}"
                 f"phase={alignment['phase']} "
                 f"error={alignment['planned_final_axis_error_deg']:.4f}deg"
             )
@@ -2340,10 +2187,6 @@ def main(args=None):
             print(output / "magnet_path.png")
             return
 
-        if node.ceiling_guard.provisional is not True:
-            # The explicit acknowledgement is harmless when the model later
-            # becomes verified, but the report must reflect the actual state.
-            report["tool_geometry_provisional"] = False
         if config_hashes(root) != report["config_sha256"]:
             raise RuntimeError("configuration files changed after planning")
         node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
@@ -2385,15 +2228,21 @@ def main(args=None):
             "measured final motor axis",
         )
         final_axis_error = None
-        if node.target_motor_axis_world is not None:
+        constrained_axis = (
+            normalized_vector(node.actual_samples[-1]["tool_normal_world"], "measured tool Z")
+            if node.target_tool_z_world is not None else final_measured_axis
+        )
+        target_axis = (node.target_tool_z_world if node.target_tool_z_world is not None
+                       else node.target_motor_axis_world)
+        if target_axis is not None:
             final_axis_error = math.acos(float(np.clip(
-                np.dot(final_measured_axis, node.target_motor_axis_world),
+                np.dot(constrained_axis, target_axis),
                 -1.0,
                 1.0,
             )))
             if final_axis_error > FINAL_AXIS_TOLERANCE_RAD:
                 raise RuntimeError(
-                    "measured final motor-axis error is "
+                    "measured final axis error is "
                     f"{math.degrees(final_axis_error):.3f} deg"
                 )
         execution = {
@@ -2403,34 +2252,26 @@ def main(args=None):
             "dashboard_stop_succeeded": bool(node.dashboard_stop_succeeded),
             "dashboard_stop_message": node.dashboard_stop_message,
             "sample_count": len(node.actual_samples),
+            "recording_error": node.recording_error,
             "final_magnet_world_mm": (final_measured * 1000.0).tolist(),
             "final_error_mm": final_error * 1000.0,
             "final_motor_axis_world": final_measured_axis.tolist(),
+            "final_tool_z_world": node.actual_samples[-1]["tool_normal_world"],
             "final_motor_axis_error_deg": (
                 None
-                if final_axis_error is None
+                if final_axis_error is None or node.target_tool_z_world is not None
                 else math.degrees(final_axis_error)
             ),
-            "maximum_path_error_mm": max(
-                value["path_error_mm"] for value in node.actual_samples
-            ),
-            "maximum_measured_joint_speed_deg_s": max(
-                value["joint_speed_deg_s"] for value in node.actual_samples
-            ),
-            "maximum_measured_magnet_speed_mm_s": max(
-                value["magnet_speed_mm_s"] for value in node.actual_samples
-            ),
-            "maximum_measured_tool_angular_speed_deg_s": max(
-                value["tool_angular_speed_deg_s"]
-                for value in node.actual_samples
-            ),
-            "maximum_orientation_path_error_deg": max(
-                value["orientation_path_error_deg"]
-                for value in node.actual_samples
+            "final_tool_z_error_deg": (
+                math.degrees(final_axis_error)
+                if node.target_tool_z_world is not None else None
             ),
         }
         write_json_exclusive(output / "execution.json", execution)
-        plot_trajectory(output, output / "magnet_path.png")
+        plot_trajectory(
+            output / "plan.json" if node.recording_error else output,
+            output / "magnet_path.png",
+        )
         print("EXECUTION_SUCCESS " + json.dumps(execution, ensure_ascii=False))
         print(actual_path)
         print(output / "magnet_path.png")

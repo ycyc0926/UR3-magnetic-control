@@ -6,14 +6,17 @@ network:
 robot:
   type: ur3
   calibration_file: /home/yc/UR3/config/ur3_calibration.yaml
-  # Sphere-centre TCP measured from the flange/tool0 frame.
-  magnet_tcp_xyz_m: [0.0, -0.062, 0.041]
+  # Centre of the 30 x 30 mm axial magnet in tool0 coordinates.
+  magnet_tcp_xyz_m: [0.0, 0.0, 0.0975]
   magnet_tcp_rpy_rad: [0.0, 0.0, 0.0]
-  magnet_sphere_radius_m: 0.010
-  payload_mass_kg: 0.32
-  # The shaft points from the motor toward the sphere along tool0 -Y.
-  motor_axis_tool_vector: [0.0, -1.0, 0.0]
-  # Physically confirmed by the user on 2026-09-19.
+  magnet_cylinder_radius_m: 0.015
+  magnet_cylinder_length_m: 0.030
+  magnet_axis_tool_vector: [1.0, 0.0, 0.0]
+  magnet_grade: N52
+  motor_model: HT4510-J10-2E
+  payload_mass_kg: 0.54
+  motor_axis_tool_vector: [0.0, 0.0, 1.0]
+  # Shaft is coaxial with tool0 Z; the user updated the teach pendant.
   motor_axis_verified: true
 
 camera:
@@ -24,20 +27,11 @@ camera:
   frame_id: camera_optical_frame
 
 safety:
-  target_timeout_s: 0.2
-  robot_state_timeout_s: 0.2
-  initial_max_tcp_speed_m_s: 0.02
-  initial_max_motor_rpm: 0.0
-  # One global policy for nominal paths, stopping models and live checks.
-  # Motion-specific code must not override the acrylic-bottom or side values.
+  # Acrylic and table clearances used by planning and live geometry checks.
   clearance_policy_m:
     acrylic_bottom: 0.005
     side: 0.010
     table: 0.010
-  workspace_bounds_m:
-    x: [-0.45, 0.45]
-    y: [-0.75, -0.20]
-    z: [0.05, 0.60]
 
 # 相机与磁铁支架固定后再测量这些参数。
 calibration:

@@ -13,6 +13,7 @@ from ur3_magnetic_control.acrylic_ceiling_guard import (
     load_guard_configuration,
     transform_point,
 )
+from shape_msgs.msg import SolidPrimitive
 from ur3_magnetic_control.acrylic_geometry import (
     acrylic_ceiling_gap_m,
     acrylic_inner_lower_left_world_xy_m,
@@ -147,6 +148,19 @@ class ClearancePolicyTests(unittest.TestCase):
         self.assertTrue(
             all(list(item.primitives[0].dimensions) == [1.0, 2.0, 2.0] for item in objects)
         )
+
+    def test_attached_magnet_encloses_all_motor_phases(self):
+        guard = object.__new__(AcrylicCeilingGuard)
+        guard.configuration = load_guard_configuration()
+        collision = guard._attached_magnet_cylinder().object
+        self.assertEqual(collision.primitives[0].type, SolidPrimitive.CYLINDER)
+        self.assertAlmostEqual(collision.primitives[0].dimensions[0], 0.030)
+        self.assertAlmostEqual(collision.primitives[0].dimensions[1],
+                               (0.015 ** 2 + 0.015 ** 2) ** 0.5)
+        pose = collision.primitive_poses[0]
+        self.assertAlmostEqual(pose.position.z, 0.0975)
+        self.assertAlmostEqual(pose.orientation.y, 0.0)
+        self.assertAlmostEqual(pose.orientation.w, 1.0)
 
     def test_active_code_has_no_legacy_per_motion_clearance_settings(self):
         root = DEFAULT_PROJECT_ROOT

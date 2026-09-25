@@ -4,22 +4,24 @@
 `table_world` 中磁铁中心的绝对坐标（单位 mm），自动换算成 `tool0` 位姿。默认
 保持开始时的末端姿态不变，也可以显式要求最终电机轴平行于 `table_world` 的
 X/Y/Z 轴。当前支持单点、XY 正方形、XY 圆形和任意三维多路点路径。
+也可选择在轨迹期间使 `tool0` 的 Z 轴平行桌面。
 
-脚本只控制机械臂，不发送任何电机命令。当前电机必须停止；以后如果需要边转电机
-边移动，应另做电机状态、线缆和急停联锁，不能删掉本脚本的确认开关来代替。
+脚本只控制机械臂，不发送任何电机命令。移动前请确认电机已停止。
 
 ## 当前使用的工具参数
 
-参数直接从当前配置读取，不使用计划更换的海泰电机或 30×30 mm 圆柱磁铁参数：
+参数直接从当前配置读取：
 
-- 磁铁中心相对 `tool0`：`[0, -62, 41] mm`；
-- 当前磁铁碰撞球半径：`10 mm`；
-- 当前工具负载记录：`0.32 kg`；
-- 当前电机轴：`tool0 -Y`；
-- 暂定完整工具包络：`[-30,-75,-5]` 到 `[30,50,70] mm`（`tool0` 坐标）。
+- 电机：`HT4510-J10-2E`，转轴与 `tool0 +Z` 同轴；
+- 磁铁：N52 轴向充磁圆柱，直径和长度各 30 mm，参考相位 N 指向 `tool0 +X`；
+- 磁铁中心相对 `tool0`：`[0, 0, 97.5] mm`；
+- 完整固定件负载：`0.54 kg`，质心尚未实测；
+- 用户测得最远径向尺寸 38 mm、最高到 `tool0 +Z 115 mm`；法兰壳 STL 最大径向约 38.91 mm，因此暂定完整工具包络为 `[-39,-39,-5]` 到 `[39,39,115] mm`。
 
-最后一项尚未现场确认包含全部支架、凸出件和线缆，因此真实执行需要单独明确接受
-这个暂定包络。软件检查是应用级保护，不是安全认证功能。
+磁铁转动时 N 极方向随相位变化；碰撞模型使用绕电机轴旋转一周的包络，半径约
+21.21 mm、高 30 mm。
+
+包络的负 Z 端及线缆形状尚未实测。旧硬件的轨迹规划结果和起点假设在换件后失效。
 
 ## 构建
 
@@ -30,21 +32,11 @@ colcon build --symlink-install --packages-select ur3_magnetic_control
 source /home/yc/UR3/ros2_env.sh
 ```
 
-规划需要真实或仿真的 `/joint_states`、MoveIt 服务和本机标定模型。真实系统通常先
-启动 UR3 驱动，再另开终端启动标定版 MoveIt：
+规划需要真实或仿真的 `/joint_states`、MoveIt 服务和本机标定模型。实验时在
+终端 1 同时启动 UR3 驱动与标定版 MoveIt：
 
 ```bash
-ros2 launch ur_robot_driver ur_control.launch.py \
-  ur_type:=ur3 \
-  robot_ip:=192.168.56.101 \
-  kinematics_params_file:=/home/yc/UR3/config/ur3_calibration.yaml \
-  launch_rviz:=true
-```
-
-```bash
-source /home/yc/UR3/ros2_env.sh
-ros2 launch /home/yc/UR3/robot/calibrated_moveit.launch.py \
-  ur_type:=ur3 launch_rviz:=false
+source /home/yc/UR3/ros2_env.sh && ros2 launch /home/yc/UR3/robot/motion_stack.launch.py
 ```
 
 仅做规划时不要求播放示教器的 External Control；真实执行前则必须播放且程序树中
@@ -55,26 +47,45 @@ ros2 launch /home/yc/UR3/robot/calibrated_moveit.launch.py \
 下面坐标只是命令格式示例。每次都应先用本次实际目标执行只规划模式，并在 RViz、
 `plan.json` 和轨迹图中复核结果。没有 `--execute` 时不会发送运动目标。
 
-单点：
+单点：省略 Z 时保持启动规划时的磁铁中心高度。速度默认 10 mm/s，可用
+`--speed-mm-s` 设置为 5–20 mm/s。
 
 ```bash
-ros2 run ur3_magnetic_control magnet_trajectory point \
-  --target-mm 120 10 350 --speed-mm-s 5
+ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148
 ```
 
-边长 20 mm、中心为 `(120,10,350) mm` 的闭合正方形：
+如需指定高度，仍用 `--target-mm X Y Z`。
+
+边长 20 mm、中心为 `(120,10,350) mm` 的闭合正方形。正方形默认先使
+`tool0 +Z`（也是电机转轴）平行桌面，再开始平面轨迹：
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory square \
   --center-mm 120 10 350 --size-mm 20 \
-  --rotation-deg 0 --speed-mm-s 5
+  --rotation-deg 0
 ```
+
+若磁铁**当前**在 `(88,148)` mm，以它作左下角起点走 50×50 mm 正方形，
+中心是 `(113,173)` mm。`--center-xy-mm` 保持当前磁铁高度。先规划新硬件路径：
+
+```bash
+ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 113 173 --size-mm 50 --tool-z-heading-deg 60
+```
+
+`--tool-z-parallel-table` 也可显式选择该模式。换件前验证的姿态和路径不适用于新偏置；
+若规划显示逆解分支不可达，可检查现场姿态后试用滚转角或 2–50 mm 分段规划。
+
+```bash
+ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 113 173 --size-mm 50 --tool-z-parallel-table --tool-z-heading-deg 60 --axis-roll-deg 90 --planning-chunk-mm 50
+```
+
+这条命令只做规划，尚未在新工具上验证可达性。
 
 半径 10 mm 的闭合圆：
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory circle \
-  --center-mm 120 10 350 --radius-mm 10 --speed-mm-s 5
+  --center-mm 120 10 350 --radius-mm 10
 ```
 
 圆会自动选取足够路点，使相邻弦长不超过 2 mm；也可用 `--samples` 指定更多点。
@@ -84,11 +95,10 @@ ros2 run ur3_magnetic_control magnet_trajectory circle \
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory waypoints \
-  --file /home/yc/UR3/robot/magnet_waypoints.example.yaml \
-  --speed-mm-s 5
+  --file /home/yc/waypoints.yaml
 ```
 
-YAML/JSON 可写成：
+先将自己的路点保存到该文件。YAML/JSON 可写成：
 
 ```yaml
 frame: table_world
@@ -108,38 +118,36 @@ CSV 列名固定为 `x_mm,y_mm,z_mm`。
 
 ## 电机轴方向约束
 
-用 `--motor-axis-parallel x|y|z` 指定最终轴线。`--motor-axis-direction nearest`
+用 `--motor-axis-parallel x|y|z` 指定最终轴线；正方形默认使 `tool0 +Z` 和电机轴
+平行桌面，并在平移前完成对齐。`table` 模式要求电机轴位于 `tool0` 的 XY 平面，
+不适用于当前电机。`--motor-axis-direction nearest`
 （默认）会在正、负两个平行方向中选择当前姿态转角较小的一侧，也可以用
-`positive` 或 `negative` 锁定符号。默认 `--axis-alignment-phase after`：先走完球心
-位置路径，再保持球心不动、让 `tool0` 绕球心旋转；`before` 则先原地对轴，再以新
+`positive` 或 `negative` 锁定符号。默认 `--axis-alignment-phase after`：先走完磁铁中心
+位置路径，再保持磁铁中心不动、让 `tool0` 绕磁铁中心旋转；`before` 则先原地对轴，再以新
 姿态走位置路径。两种方式都重新检查完整工具包络、碰撞、关节限位和净空。
 
 轴向只约束两个姿态自由度，剩余的绕轴滚转可用 `--motor-axis-roll-deg` 选择。
 它不会改变最终轴向，但可能避开腕部逆解边界。应先从 `0` 开始只规划；只有规划
 表明最小转角姿态不可达时，才选择通过审核的非零值。工具角速度与关节速度的规划
-上限均为 5°/s，实测工具角速度中止阈值为 7°/s；实时监控还会检查姿态是否偏离
-已审核的平移/绕球心旋转路径。
+上限均为 5°/s。
 
 例如，最终轴平行世界 Y 且选择最近方向：
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory point \
-  --target-mm 120 10 350 --speed-mm-s 5 \
+  --target-mm 120 10 350 \
   --planning-chunk-mm 40 \
   --motor-axis-parallel y --motor-axis-direction nearest \
   --axis-alignment-phase after
 ```
 
-如果机械臂开始时已在配置工作区以外，只允许使用经过复核的路点文件，并显式添加
-`--allow-workspace-ingress`。该模式只允许已有越界量逐样本单调减小；一旦进入工作区
-便不允许再次离开。
-
-工作区外恢复或必须绕障的路径应保存为明确的多路点文件，先只规划审核；任何手动
-移动都会使旧计划失效，不能重放历史轨迹。
+需要绕障的路径可保存为明确的多路点文件，先只规划审核；任何手动移动都会使旧计划
+失效，不能重放历史轨迹。
 
 ## 输出和重新绘图
 
-默认在 `robot/trajectory_runs/<UTC时间>_<命令>/` 新建一个不可覆盖的结果目录：
+默认在 `~/.local/share/ur3/trajectory_runs/<UTC时间>_<命令>/` 新建一个不可覆盖的结果目录；
+设置 `XDG_DATA_HOME` 时使用该目录下的 `ur3/trajectory_runs/`。可用 `--output` 指定其他位置。
 
 - `plan.json`：目标、配置哈希、完整关节轨迹、规划磁铁中心轨迹和净空结果；
 - `magnet_path.png`：请求/规划/实测 XY 路径以及 X/Y/Z 随时间曲线；
@@ -151,34 +159,26 @@ ros2 run ur3_magnetic_control magnet_trajectory point \
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory plot \
-  --input /home/yc/UR3/robot/trajectory_runs/运行目录
+  --input /home/yc/.local/share/ur3/trajectory_runs/运行目录
 ```
 
 也可把 `--input` 指向单个 `plan.json` 或 `actual_magnet_path.jsonl`，并用
 `--output` 指定 PNG。
 
-## 真实执行门控
+## 真实执行
 
-真实执行会从最新静止状态重新规划，不会直接重放旧的 `plan.json`。只有下面所有
-参数同时存在才会发送轨迹：
+真实执行会从最新静止状态重新规划，不会直接重放旧的 `plan.json`。
+终端 1 启动后，终端 2 用下面一条命令移动到 `(88, 148)` mm，保持当前磁铁高度，
+默认速度 10 mm/s。只有 `--execute` 会发送轨迹：
 
 ```bash
-ros2 run ur3_magnetic_control magnet_trajectory point \
-  --target-mm 120 10 350 --speed-mm-s 5 \
-  --execute \
-  --confirmation-token I_ACCEPT_REAL_ROBOT_MOTION \
-  --accept-provisional-tool-envelope \
-  --motor-stopped \
-  --onsite-clearance-confirmed \
-  --sole-operator-confirmed \
-  --external-control-only-confirmed
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148 --execute
 ```
 
-这些参数是对“本次动作”的现场确认，不应写进 alias 或永久启动脚本。执行前还应
-核对示教器限速、TCP/负载、急停位置、人员和线缆；任一项不成立就只做规划。
+执行前核对示教器限速、TCP/负载、急停位置、人员和线缆。
 
-执行前还会确认 UR Dashboard Stop 服务可用。如果实时几何、反馈新鲜度、速度或
-轨迹误差任一检查失败，脚本先调用 Dashboard Stop 停止 External Control 程序，
+执行前还会确认 UR Dashboard Stop 服务可用。如果亚克力或桌面净空失败、关节反馈
+失去新鲜度，脚本先调用 Dashboard Stop 停止 External Control 程序，
 然后才取消 MoveIt 动作。原因是取消 ROS 动作不能保证已进入 UR 控制器缓冲区的
 轨迹立即停止。Dashboard Stop 仍不是安全等级急停；若现场仍在运动，必须使用
 示教器停止或硬件急停，且不得自动重试。
@@ -186,22 +186,19 @@ ros2 run ur3_magnetic_control magnet_trajectory point \
 ## 自动检查范围
 
 - 使用本机 UR3 标定哈希，拒绝通用或错误的 MoveIt 模型；
-- 默认固定开始姿态；显式指定轴向时，以 1° 姿态路点绕球心旋转，并按当前
-  62/41 mm 偏置逐路点换算磁铁中心与 `tool0`；
+- 默认固定开始姿态；显式指定轴向时，以 1° 姿态路点绕磁铁中心旋转，并按当前
+  `[0,0,97.5] mm` 偏置逐路点换算磁铁中心与 `tool0`；
 - MoveIt 检查自碰撞、环境碰撞、关节跳变及带 0.15 rad 余量的关节限位，并对
   每段控制器样条的 1/4、1/2、3/4 内点再次做状态碰撞检查；
-- 完整 URDF 连杆、磁铁球和暂定完整工具包络均参与独立几何复核；
-- 全局最低净空为板底 5 mm、左右侧各 10 mm、桌面 10 mm；独立轨迹检查再增加
-  2 mm 执行余量；
+- 完整 URDF 连杆、磁铁圆柱和暂定完整工具包络均参与独立几何复核；
+- 全局最低净空为板底 5 mm、左右侧各 10 mm、桌面 10 mm；
 - 只有完整几何包络满足 `max(table_world Y) < 25 mm` 才免除板底限制；
-- 磁铁中心还必须位于 `base` 坐标的配置工作区内；
 - 笛卡尔采样最大 2 mm，单段最大 300 mm，总路径最大 1000 mm；
-- 请求速度范围 0.1–20 mm/s，规划关节速度和工具角速度最大 5°/s；
-- 关节位置限位、规划/实测速度限位不能用急停承诺替代或关闭；急停只是最后保护；
+- 请求速度默认 10 mm/s，范围 5–20 mm/s；规划关节速度和工具角速度最大 5°/s；
+- 规划仍检查关节限位、碰撞和请求速度；
 - 时间参数化后的磁铁路径与请求路径双向误差不超过 0.75 mm；
-- 执行时实时检查完整几何、姿态路径、关节速度、工具角速度、磁铁速度和 2 mm
-  路径偏差；最终测量位置误差必须不超过 0.75 mm，指定轴向时最终轴误差必须不
-  超过 0.25°。
+- 执行时实时检查完整几何与亚克力、桌面边界；实测速度和路径偏差不再触发停机。
+  最终测量位置误差必须不超过 0.75 mm，指定轴向时最终轴误差必须不超过 0.25°。
 
 未建模项仍包括平台立柱、松动物体和完整动态线缆形状。控制器取消轨迹也不等价于
 安全等级急停，所以现场硬件安全设置始终优先。

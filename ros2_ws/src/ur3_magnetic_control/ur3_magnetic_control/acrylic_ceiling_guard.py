@@ -26,7 +26,7 @@ DEFAULT_PROJECT_ROOT = Path("/home/yc/UR3")
 CEILING_OBJECT_ID = "acrylic_ceiling_forbidden"
 LEFT_OBJECT_ID = "acrylic_left_clearance_forbidden"
 RIGHT_OBJECT_ID = "acrylic_right_clearance_forbidden"
-MAGNET_OBJECT_ID = "magnet_sphere_guard"
+MAGNET_OBJECT_ID = "magnet_cylinder_guard"
 CEILING_REGION_SPAN_M = 2.0
 
 
@@ -63,16 +63,24 @@ def load_guard_configuration():
         raise ValueError("global clearance policy is not physically valid")
 
     tcp = [float(value) for value in system["robot"]["magnet_tcp_xyz_m"]]
-    radius = float(system["robot"]["magnet_sphere_radius_m"])
+    radius = float(system["robot"]["magnet_cylinder_radius_m"])
+    length = float(system["robot"]["magnet_cylinder_length_m"])
+    magnet_axis = [float(value) for value in system["robot"]["magnet_axis_tool_vector"]]
     motor_axis = [
         float(value) for value in system["robot"]["motor_axis_tool_vector"]
     ]
-    if (len(tcp) != 3 or len(motor_axis) != 3 or radius <= 0.0
-            or not all(math.isfinite(v) for v in [*tcp, *motor_axis, radius])):
+    if (len(tcp) != 3 or len(motor_axis) != 3 or len(magnet_axis) != 3
+            or radius <= 0.0 or length <= 0.0
+            or not all(math.isfinite(v) for v in [*tcp, *motor_axis, *magnet_axis, radius, length])):
         raise ValueError("invalid magnetic tool geometry in ur3_system.yaml")
     axis_norm = math.sqrt(sum(value * value for value in motor_axis))
-    if axis_norm <= 0.0:
-        raise ValueError("motor_axis_tool_vector must be nonzero")
+    magnet_axis_norm = math.sqrt(sum(value * value for value in magnet_axis))
+    if axis_norm <= 0.0 or magnet_axis_norm <= 0.0:
+        raise ValueError("tool axes must be nonzero")
+    motor_axis = [value / axis_norm for value in motor_axis]
+    magnet_axis = [value / magnet_axis_norm for value in magnet_axis]
+    if abs(sum(a * b for a, b in zip(motor_axis, magnet_axis))) > 1.0e-6:
+        raise ValueError("magnet axis must be perpendicular to the motor shaft")
 
     transform = world["T_base_from_world"]
     if len(transform) != 4 or any(len(row) != 4 for row in transform):
@@ -93,8 +101,12 @@ def load_guard_configuration():
             for key in ("x", "y", "z")
         },
         "magnet_tcp_xyz_m": tcp,
-        "magnet_sphere_radius_m": radius,
-        "motor_axis_tool_vector": [value / axis_norm for value in motor_axis],
+        "magnet_cylinder_radius_m": radius,
+        "magnet_cylinder_length_m": length,
+        "magnet_axis_tool_vector": magnet_axis,
+        "magnet_swept_radius_m": math.hypot(radius, length / 2),
+        "magnet_swept_length_m": 2 * radius,
+        "motor_axis_tool_vector": motor_axis,
         "motor_axis_verified": system["robot"].get("motor_axis_verified") is True,
         "kinematics_hash": kinematics_hash,
     }
@@ -217,11 +229,12 @@ class AcrylicCeilingGuard:
             ),
         ]
 
-    def _attached_magnet_sphere(self):
+    def _attached_magnet_cylinder(self):
         primitive = SolidPrimitive()
-        primitive.type = SolidPrimitive.SPHERE
+        primitive.type = SolidPrimitive.CYLINDER
         primitive.dimensions = [
-            self.configuration["magnet_sphere_radius_m"]
+            self.configuration["magnet_swept_length_m"],
+            self.configuration["magnet_swept_radius_m"],
         ]
         pose = Pose()
         (
@@ -229,7 +242,13 @@ class AcrylicCeilingGuard:
             pose.position.y,
             pose.position.z,
         ) = self.configuration["magnet_tcp_xyz_m"]
-        pose.orientation.w = 1.0
+        axis = self.configuration["motor_axis_tool_vector"]
+        quaternion = [-axis[1], axis[0], 0.0, 1.0 + axis[2]]
+        if math.hypot(*quaternion) < 1.0e-12:
+            quaternion = [1.0, 0.0, 0.0, 0.0]
+        norm = math.hypot(*quaternion)
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = [value / norm for value in quaternion]
 
         collision = CollisionObject()
         collision.header.frame_id = "tool0"
@@ -260,7 +279,7 @@ class AcrylicCeilingGuard:
         request.scene.robot_state = copy.deepcopy(robot_state)
         request.scene.robot_state.is_diff = True
         request.scene.robot_state.attached_collision_objects = [
-            self._attached_magnet_sphere()
+            self._attached_magnet_cylinder()
         ]
         response = self.node.call(self.apply_client, request, timeout=10.0)
         if not response.success:
@@ -270,7 +289,7 @@ class AcrylicCeilingGuard:
         """Return a state that explicitly retains the guarded attached tool."""
         guarded = copy.deepcopy(robot_state)
         guarded.is_diff = True
-        guarded.attached_collision_objects = [self._attached_magnet_sphere()]
+        guarded.attached_collision_objects = [self._attached_magnet_cylinder()]
         return guarded
 
     def validate_state(self, robot_state, label):
