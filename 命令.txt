@@ -20,3 +20,17 @@ source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajecto
 source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 113 173 --size-mm 50 --tool-z-parallel-table --tool-z-heading-deg 60 --planning-chunk-mm 50
 
 这两个中心坐标仅在磁铁当前位于 (88, 148) mm 时对应左下角起点；旧工具的可达性结果不适用于新工具。
+
+
+驱动机械臂：
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-mm 146 146 400 --motor-rpm 10 --execute
+
+电机停止转动：
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor speed 0
+电机以最小距离回归原点
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor home
+
+断电重连自动恢复磁铁原点（服务状态）：
+systemctl --user status ur3-motor-origin.service
+手动恢复已保存的磁铁原点：
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor restore-origin

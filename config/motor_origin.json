@@ -1,0 +1,5 @@
+{
+  "schema": "ze300-magnet-origin/v1",
+  "single_turn_counts": 0,
+  "reference": "magnet N points along tool0 +X"
+}

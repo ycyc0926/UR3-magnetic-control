@@ -8,9 +8,8 @@ user_confirmed:
   distances_are_to_inner_faces: true
 left_inner_x_m: -0.140
 right_inner_x_m: 0.590
-# Conservatively require all modeled geometry to remain between these infinite
-# planes, including outside the finite panels' Y/Z extents. The single active
-# clearance policy is config/ur3_system.yaml:safety.clearance_policy_m; do not
-# put a separate side-clearance setting in this geometry file.
-model: infinite_parallel_yz_planes
+# Both side panels start at the acrylic front edge Y=25 mm (user confirmed).
+# Geometry wholly before that edge is outside both side panels.
+# The single active clearance policy is config/ur3_system.yaml.
+model: parallel_yz_planes_from_acrylic_front_edge
 not_modeled: [aluminium_posts_inside_corridor, loose_objects, cables]

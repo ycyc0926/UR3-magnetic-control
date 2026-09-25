@@ -9,5 +9,6 @@
 - `ur3_realtime_monitor.py`、`rtde_status_outputs.py`、`record_rtde_outputs.py`：
   只读 RTDE 诊断和记录，不发送运动命令；对应测试位于 `tests/`。
 
-轨迹结果默认保存到 `~/.local/share/ur3/trajectory_runs/`，不写入源码目录。
+真实执行默认保存在 `/home/yc/UR3/experiments/日期_时间/`，只规划结果保存在 `/home/yc/UR3/plans/`；
+执行时一并截取 H 机器人的相机轨迹，不写入源码目录。
 旧电机与磁铁的规划和执行记录已清理；新硬件需重新规划。

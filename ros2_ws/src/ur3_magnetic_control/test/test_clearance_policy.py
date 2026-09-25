@@ -101,6 +101,23 @@ class ClearancePolicyTests(unittest.TestCase):
         )
         self.assertAlmostEqual(gaps["ceiling"], 0.010741)
 
+    def test_side_panels_do_not_cover_space_before_y_25_mm(self):
+        table = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/table_world_calibration.yaml").read_text()
+        )
+        sides = yaml.safe_load(
+            (DEFAULT_PROJECT_ROOT / "config/acrylic_side_boundaries.yaml").read_text()
+        )
+        before = modeled_boundary_gaps_m(
+            table, sides, [-0.20, -0.12, 0.0], [-0.18, -0.109, 0.4]
+        )
+        self.assertEqual(before["left"], float("inf"))
+        self.assertEqual(before["right"], float("inf"))
+        touching = modeled_boundary_gaps_m(
+            table, sides, [-0.20, 0.020, 0.0], [-0.18, 0.025, 0.4]
+        )
+        self.assertAlmostEqual(touching["left"], -0.060)
+
     def test_missing_or_ambiguous_footprint_fails_closed(self):
         table = yaml.safe_load(
             (DEFAULT_PROJECT_ROOT / "config/table_world_calibration.yaml").read_text()
@@ -148,6 +165,13 @@ class ClearancePolicyTests(unittest.TestCase):
         self.assertTrue(
             all(list(item.primitives[0].dimensions) == [1.0, 2.0, 2.0] for item in objects)
         )
+        expected_y = transform_point(
+            guard.configuration["T_base_from_world"],
+            [guard.configuration["left_guard_world_x_m"] - 0.5, 1.025, 0.5],
+        )
+        actual = objects[0].primitive_poses[0].position
+        self.assertAlmostEqual(actual.x, expected_y[0])
+        self.assertAlmostEqual(actual.y, expected_y[1])
 
     def test_attached_magnet_encloses_all_motor_phases(self):
         guard = object.__new__(AcrylicCeilingGuard)

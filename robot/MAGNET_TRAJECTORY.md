@@ -6,7 +6,8 @@
 X/Y/Z 轴。当前支持单点、XY 正方形、XY 圆形和任意三维多路点路径。
 也可选择在轨迹期间使 `tool0` 的 Z 轴平行桌面。
 
-脚本只控制机械臂，不发送任何电机命令。移动前请确认电机已停止。
+轨迹命令可用 `--motor-rpm` 在机械臂运动前启动 ZE300 电机。规划模式不发送电机指令。
+成功后电机保持设定转速；若机械臂执行失败，程序尝试发送 0 rpm。
 
 ## 当前使用的工具参数
 
@@ -47,8 +48,17 @@ source /home/yc/UR3/ros2_env.sh && ros2 launch /home/yc/UR3/robot/motion_stack.l
 下面坐标只是命令格式示例。每次都应先用本次实际目标执行只规划模式，并在 RViz、
 `plan.json` 和轨迹图中复核结果。没有 `--execute` 时不会发送运动目标。
 
-单点：省略 Z 时保持启动规划时的磁铁中心高度。速度默认 10 mm/s，可用
-`--speed-mm-s` 设置为 5–20 mm/s。
+单点：省略 Z 时保持启动规划时的磁铁中心高度；使用 `--target-z-mm` 时保持当前 XY。
+速度默认 5 mm/s，可用 `--speed-mm-s` 设置为 0–20 mm/s；0 表示保持机械臂静止，
+不会发送运动命令。
+所有磁铁轨迹要求 `wrist_3_joint=0°`，规划容差 0.5°，执行监测容差 1°。
+启动轨迹前必须先使手腕 3 到达 0°。
+普通点位移动允许末端姿态相对起始姿态偏差不超过 10°，以便手腕 3 保持 0°；
+规划生成后会按固定手腕 3 的关节轨迹重新检查磁铁中心路径与碰撞。
+
+```bash
+ros2 run ur3_magnetic_control magnet_trajectory wrist3-zero --execute
+```
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148
@@ -146,20 +156,32 @@ ros2 run ur3_magnetic_control magnet_trajectory point \
 
 ## 输出和重新绘图
 
-默认在 `~/.local/share/ur3/trajectory_runs/<UTC时间>_<命令>/` 新建一个不可覆盖的结果目录；
-设置 `XDG_DATA_HOME` 时使用该目录下的 `ur3/trajectory_runs/`。可用 `--output` 指定其他位置。
+真实执行默认在 `/home/yc/UR3/experiments/<本地日期_时间>/` 新建一个不可覆盖的目录；
+一次任务的所有路点写在同一份轨迹文件中。只规划输出写入 `/home/yc/UR3/plans/`。
+可用 `--output` 指定其他位置。
+临时动作可加 `--no-record`，运行结束即清理这次产生的规划和执行文件；
+`--no-record` 不与 `--output` 同时使用。
 
-- `plan.json`：目标、配置哈希、完整关节轨迹、规划磁铁中心轨迹和净空结果；
+- `plan.json`：目标、配置哈希、完整关节轨迹、规划末端 `tool0` 与磁铁中心轨迹和净空结果；
 - `magnet_path.png`：请求/规划/实测 XY 路径以及 X/Y/Z 随时间曲线；
-- `actual_magnet_path.jsonl`：真实执行期间从关节反馈重算的磁铁中心轨迹；
+- `actual_magnet_path.jsonl`：同一任务的所有机械臂采样，含末端 `tool0` 位置与姿态、磁铁中心位置、电机角度、磁铁 N 极方向和磁铁姿态四元数；
+- `motor_samples.jsonl`：真实执行期间的电机编码器采样与电脑时间戳；
+- `h_robot/positions.csv`：按本次执行时间截取的 H 机器人相机观测；`h_robot/metadata.json` 记录源会话、帧数和检出帧数。未检测到 H 时没有有效 H 轨迹；
 - `execution.json`：执行成功和最终误差摘要；
 - `failure.json`：规划或执行失败原因。
+
+相机原始连续会话仍保存在 `/home/yc/UR3/camera/tracking_sessions/`；实验目录中的 H 数据是按时间截取的副本。
+两路数据使用电脑与相机消息时间戳对齐，没有硬件触发同步。
+`config/ur3_system.yaml` 的 `calibration.motor_phase_sign` 已按 +90° 实测结果设为 `-1`：
+编码器正转时磁铁 N 极从 tool0 +X 转向 -Y。
+`motor_encoder_turns_per_magnet_turn` 已按当前直连结构设为 `1.0`。
+后续执行的轨迹可记录磁铁 N 极方向和姿态四元数；旧记录若无同步编码器采样则无法补算。
 
 可从保存结果重新绘图：
 
 ```bash
 ros2 run ur3_magnetic_control magnet_trajectory plot \
-  --input /home/yc/.local/share/ur3/trajectory_runs/运行目录
+  --input /home/yc/UR3/experiments/运行目录
 ```
 
 也可把 `--input` 指向单个 `plan.json` 或 `actual_magnet_path.jsonl`，并用
@@ -169,11 +191,49 @@ ros2 run ur3_magnetic_control magnet_trajectory plot \
 
 真实执行会从最新静止状态重新规划，不会直接重放旧的 `plan.json`。
 终端 1 启动后，终端 2 用下面一条命令移动到 `(88, 148)` mm，保持当前磁铁高度，
-默认速度 10 mm/s。只有 `--execute` 会发送轨迹：
+默认速度 5 mm/s。只有 `--execute` 会发送轨迹：
 
 ```bash
 source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148 --execute
 ```
+
+同时以 10 rpm 旋转磁铁并移动其中心到 `(146,146,400)` mm：
+
+```bash
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-mm 146 146 400 --motor-rpm 10 --execute
+```
+
+ZE300 默认连接 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`，地址 1、115200 baud。
+端口或设备地址不同可用 `--motor-port`、`--motor-address`、`--motor-baud` 指定。
+轨迹命令也可用 `--motor-position-deg` 或 `--motor-relative-deg` 在机械臂运动前发送位置指令；
+这三个电机控制参数互斥。
+运行前需关闭 ZE300_GUI 的串口连接。可单独读取和控制电机：
+
+```bash
+source /home/yc/UR3/ros2_env.sh
+ros2 run ur3_magnetic_control ze300_motor status
+ros2 run ur3_magnetic_control ze300_motor speed 10
+ros2 run ur3_magnetic_control ze300_motor absolute 90
+ros2 run ur3_magnetic_control ze300_motor relative -90
+ros2 run ur3_magnetic_control ze300_motor home --wait
+ros2 run ur3_magnetic_control ze300_motor speed 0
+```
+
+位置单位为度；`absolute` 使用多圈绝对位置，`home` 按最短转角回到电机已设定的原点；
+`--wait` 会等到角度和转速都接近 0 再返回。
+`off` 指令会关闭电机输出并使轴自由转动。
+
+已在磁铁 N 极指向 tool0 `+X` 时保存单圈绝对角度到
+`/home/yc/UR3/config/motor_origin.json`。电机断电后多圈角度会丢失；恢复使用保存的
+单圈角度，选择最短转角。连接监视服务在当前用户登录后运行；电机重新应答时自动恢复，
+轨迹程序占用串口时等待，不会在实验过程中插入命令。查看状态或手动恢复：
+
+```bash
+systemctl --user status ur3-motor-origin.service
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor restore-origin
+```
+
+仅在重新确认磁铁 N 极方向并停止电机后，运行 `ze300_motor save-origin` 更新原点参照。
 
 执行前核对示教器限速、TCP/负载、急停位置、人员和线缆。
 
@@ -192,9 +252,9 @@ source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajecto
   每段控制器样条的 1/4、1/2、3/4 内点再次做状态碰撞检查；
 - 完整 URDF 连杆、磁铁圆柱和暂定完整工具包络均参与独立几何复核；
 - 全局最低净空为板底 5 mm、左右侧各 10 mm、桌面 10 mm；
-- 只有完整几何包络满足 `max(table_world Y) < 25 mm` 才免除板底限制；
+- 完整几何包络满足 `max(table_world Y) < 25 mm` 时，不受顶板底面与侧板约束；
 - 笛卡尔采样最大 2 mm，单段最大 300 mm，总路径最大 1000 mm；
-- 请求速度默认 10 mm/s，范围 5–20 mm/s；规划关节速度和工具角速度最大 5°/s；
+- 请求速度默认 5 mm/s，范围 0–20 mm/s（0 为静止）；规划关节速度和工具角速度最大 5°/s；
 - 规划仍检查关节限位、碰撞和请求速度；
 - 时间参数化后的磁铁路径与请求路径双向误差不超过 0.75 mm；
 - 执行时实时检查完整几何与亚克力、桌面边界；实测速度和路径偏差不再触发停机。

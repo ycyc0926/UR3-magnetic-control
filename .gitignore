@@ -10,6 +10,8 @@ ros2_ws/log/
 
 # Runtime logs
 camera/SpinView_QT_log
+experiments/
+plans/
 
 # Editors and operating systems
 .idea/

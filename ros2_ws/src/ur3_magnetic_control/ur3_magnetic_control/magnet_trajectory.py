@@ -29,6 +29,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -45,7 +46,7 @@ from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionFK
 from rcl_interfaces.srv import GetParameters
 from scipy.spatial.transform import Rotation
 from shape_msgs.msg import SolidPrimitive
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import yaml
 
 from .acrylic_ceiling_guard import AcrylicCeilingGuard, DEFAULT_PROJECT_ROOT
@@ -57,6 +58,8 @@ from .cartesian_line_move import (
 )
 from .ceiling_geometry import CeilingGeometry, sample_trajectory
 from .clearance_policy import load_clearance_limits_m
+from .experiment_data import MotorRecorder, add_magnet_pose, copy_h_positions
+from .ze300_motor import DEFAULT_PORT as DEFAULT_MOTOR_PORT, ZE300Motor, position_counts
 
 
 JOINT_NAMES = (
@@ -78,12 +81,15 @@ MAX_DURATION_S = 300.0
 # Independently planned Cartesian chunks come to rest at every chunk boundary.
 MAX_SEGMENTED_DURATION_S = 420.0
 PLANNED_JOINT_SPEED_LIMIT_RAD_S = math.radians(5.0)
+WRIST3_ZERO_PLAN_TOLERANCE_RAD = math.radians(0.5)
+WRIST3_ZERO_LIVE_TOLERANCE_RAD = math.radians(1.0)
 PLANNED_JOINT_ACCELERATION_LIMIT_RAD_S2 = 5.0
 PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S = math.radians(5.0)
 PLANNED_PATH_TOLERANCE_M = 0.00075
 FINAL_POSITION_TOLERANCE_M = 0.00075
 FINAL_AXIS_TOLERANCE_RAD = math.radians(0.25)
 PLANNED_ORIENTATION_PATH_TOLERANCE_RAD = math.radians(0.50)
+WRIST3_FIXED_TOOL_ORIENTATION_TOLERANCE_RAD = math.radians(10.0)
 PLANNED_TABLE_TILT_TOLERANCE_RAD = math.radians(0.5)
 LIVE_TABLE_TILT_TOLERANCE_RAD = math.radians(2.0)
 ORIENTATION_WAYPOINT_STEP_RAD = math.radians(1.0)
@@ -375,12 +381,16 @@ def build_point_targets(target_mm) -> tuple[list[np.ndarray], dict]:
     return [target], {"shape": "point", "target_world_mm": list(map(float, target_mm))}
 
 
-def resolve_target_height(targets_world, current_z_m):
-    return [
-        finite_point([*target, current_z_m] if len(target) == 2 else target,
-                     f"target {index}")
-        for index, target in enumerate(targets_world)
-    ]
+def resolve_target_height(targets_world, current_world):
+    current = np.asarray(current_world, dtype=float)
+    resolved = []
+    for index, target in enumerate(targets_world):
+        if len(target) == 2:
+            target = [*target, float(current[2] if current.shape == (3,) else current)]
+        elif len(target) == 1 and current.shape == (3,):
+            target = [current[0], current[1], target[0]]
+        resolved.append(finite_point(target, f"target {index}"))
+    return resolved
 
 
 def build_square_targets(center_mm, size_mm, rotation_deg=0.0, clockwise=False):
@@ -785,7 +795,7 @@ class FullToolGuard(AcrylicCeilingGuard):
     def apply(self, robot_state):
         parameters = GetParameters.Request()
         parameters.names = ["robot_description"]
-        response = self.node.call(self.description_client, parameters)
+        response = self.node.call(self.description_client, parameters, timeout=30.0)
         self.robot_description = response.values[0].string_value
         if self.configuration["kinematics_hash"] not in self.robot_description:
             raise RuntimeError(
@@ -893,6 +903,8 @@ class MagnetPathGeometry:
                 )
 
         return {
+            "tool0_world_mm": (tool_world[:3, 3] * 1000.0).tolist(),
+            "tool0_base_mm": (tool_base[:3, 3] * 1000.0).tolist(),
             "magnet_world_mm": (magnet_world * 1000.0).tolist(),
             "magnet_base_mm": (magnet_base * 1000.0).tolist(),
             "tool_quaternion_world_xyzw": quaternion_world_tool.tolist(),
@@ -994,6 +1006,7 @@ class MagnetTrajectoryNode(CartesianLineMove):
         self.table_parallel_start_world = None
         self.table_parallel_mode = None
         self.table_parallel_ready = False
+        self.tool_orientation_reference_world = None
         self.actual_stream = None
         self.actual_samples = []
         self.last_logged_state_time = None
@@ -1082,8 +1095,8 @@ class MagnetTrajectoryNode(CartesianLineMove):
         axis_alignment_phase="after",
     ):
         speed_m_s = float(speed_m_s)
-        if not math.isfinite(speed_m_s) or not 0.005 <= speed_m_s <= 0.020:
-            raise ValueError("magnet speed must be within [5, 20] mm/s")
+        if not math.isfinite(speed_m_s) or not 0.0 < speed_m_s <= 0.020:
+            raise ValueError("moving magnet speed must be within (0, 20] mm/s")
         if motor_axis_parallel is not None and motor_axis_parallel not in (
             "x", "y", "z", "table", "tool-z-table"
         ):
@@ -1114,6 +1127,11 @@ class MagnetTrajectoryNode(CartesianLineMove):
         start_state = self.current_robot_state()
         self.ceiling_guard.apply(start_state)
         self.ceiling_guard.validate_state(start_state, "current robot state")
+        wrist3 = dict(zip(start_state.joint_state.name, start_state.joint_state.position))["wrist_3_joint"]
+        if abs(wrist3) > WRIST3_ZERO_PLAN_TOLERANCE_RAD:
+            raise RuntimeError(
+                f"wrist_3_joint must be 0 deg before magnet motion; current={math.degrees(wrist3):.3f} deg"
+            )
         start_pose = self.current_tool_pose(start_state)
         rotation_base_tool = quaternion_matrix(start_pose)
         offset = np.asarray(
@@ -1128,11 +1146,15 @@ class MagnetTrajectoryNode(CartesianLineMove):
         )
         world_from_base = np.linalg.inv(base_from_world)
         start_magnet_world = homogeneous_point(world_from_base, start_magnet_base)
-        targets_world = resolve_target_height(targets_world, start_magnet_world[2])
+        targets_world = resolve_target_height(targets_world, start_magnet_world)
         if (len(targets_world) > 1
                 and np.linalg.norm(targets_world[0] - start_magnet_world) < 0.0005):
             targets_world = targets_world[1:]
         start_rotation_world = world_from_base[:3, :3] @ rotation_base_tool
+        self.tool_orientation_reference_world = (
+            Rotation.from_matrix(start_rotation_world)
+            if motor_axis_parallel is None else None
+        )
         self.table_parallel_start_world = (
             start_magnet_world.copy()
             if motor_axis_parallel in ("table", "tool-z-table") else None
@@ -1333,6 +1355,7 @@ class MagnetTrajectoryNode(CartesianLineMove):
             if len(segment.points) < 2:
                 raise RuntimeError(f"{label} returned too few trajectory points")
             self.unwrap_and_check_joint_limits(segment, segment_state)
+            hold_wrist3_zero(segment)
             self.validate_trajectory_states(segment, segment_state)
             segment_trajectories.append(segment)
             segment_state = robot_state_after_trajectory(segment_state, segment)
@@ -1345,6 +1368,12 @@ class MagnetTrajectoryNode(CartesianLineMove):
                 segment_trajectories
             )
         trajectory = solution.joint_trajectory
+        wrist3_index = trajectory.joint_names.index("wrist_3_joint")
+        wrist3_error = max(abs(point.positions[wrist3_index]) for point in trajectory.points)
+        if wrist3_error > WRIST3_ZERO_PLAN_TOLERANCE_RAD:
+            raise RuntimeError(
+                f"planned wrist_3_joint departed 0 deg by {math.degrees(wrist3_error):.3f} deg"
+            )
         fraction = min(fractions)
 
         self.geometry = MagnetPathGeometry(
@@ -1397,17 +1426,18 @@ class MagnetTrajectoryNode(CartesianLineMove):
             trajectory,
             self.geometry,
         )
-        additional_scale = max(
-            1.0,
-            maximum_joint_speed / PLANNED_JOINT_SPEED_LIMIT_RAD_S,
-            maximum_magnet_speed / speed_m_s,
-            maximum_tool_angular_speed
-            / PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S,
-        )
-        if additional_scale > 1.000001:
-            # Leave a small numerical margin because the trace is rebuilt by
-            # interpolation after the timestamps and derivatives are scaled.
-            additional_scale *= 1.001
+        for _ in range(4):
+            additional_scale = max(
+                1.0,
+                maximum_joint_speed / PLANNED_JOINT_SPEED_LIMIT_RAD_S,
+                maximum_magnet_speed / speed_m_s,
+                maximum_tool_angular_speed
+                / PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S,
+            )
+            if additional_scale <= 1.0000001:
+                break
+            # Sampling positions shift slightly as timestamps are rescaled.
+            additional_scale *= 1.02
             duration_before_speed_limits = scaled_duration
             joint_speed_before_limits = maximum_joint_speed
             magnet_speed_before_limits = maximum_magnet_speed
@@ -1525,15 +1555,16 @@ class MagnetTrajectoryNode(CartesianLineMove):
             for entry in trace
         ]
         maximum_orientation_path_error = max(orientation_path_errors)
-        if (
-            maximum_orientation_path_error
-            > PLANNED_ORIENTATION_PATH_TOLERANCE_RAD
-        ):
+        orientation_tolerance = (
+            WRIST3_FIXED_TOOL_ORIENTATION_TOLERANCE_RAD
+            if motor_axis_parallel is None else PLANNED_ORIENTATION_PATH_TOLERANCE_RAD
+        )
+        if maximum_orientation_path_error > orientation_tolerance:
             raise RuntimeError(
                 "time-parameterized tool orientation departed the requested "
                 "pose path: "
                 f"{math.degrees(maximum_orientation_path_error):.3f} deg > "
-                f"{math.degrees(PLANNED_ORIENTATION_PATH_TOLERANCE_RAD):.3f} deg"
+                f"{math.degrees(orientation_tolerance):.3f} deg"
             )
 
         final_motor_axis = normalized_vector(
@@ -1650,8 +1681,20 @@ class MagnetTrajectoryNode(CartesianLineMove):
         ):
             return
         mapping = dict(zip(message.name, message.position))
+        wrist3_error = abs(mapping["wrist_3_joint"])
+        if wrist3_error > WRIST3_ZERO_LIVE_TOLERANCE_RAD:
+            raise RuntimeError(
+                f"wrist_3_joint departed 0 deg by {math.degrees(wrist3_error):.3f} deg"
+            )
         positions = np.asarray([mapping[name] for name in JOINT_NAMES], dtype=float)
         checked = self.geometry.inspect(JOINT_NAMES, positions)
+        if self.tool_orientation_reference_world is not None:
+            current_rotation = Rotation.from_quat(checked["tool_quaternion_world_xyzw"])
+            deviation = (self.tool_orientation_reference_world.inv() * current_rotation).magnitude()
+            if deviation > WRIST3_FIXED_TOOL_ORIENTATION_TOLERANCE_RAD:
+                raise RuntimeError(
+                    f"tool orientation departed the start by {math.degrees(deviation):.3f} deg"
+                )
         if self.table_parallel_start_world is not None:
             tilt = (horizontal_tool_z_error_rad(checked)
                     if self.table_parallel_mode == "tool-z-table"
@@ -1812,7 +1855,17 @@ def plot_trajectory(input_path: Path, output_path: Path):
 
 
 def add_motion_arguments(parser):
-    parser.add_argument("--speed-mm-s", type=float, default=10.0)
+    parser.add_argument("--speed-mm-s", type=float, default=5.0)
+    motor_command = parser.add_mutually_exclusive_group()
+    motor_command.add_argument("--motor-rpm", type=float,
+                               help="start ZE300 rotation before robot motion")
+    motor_command.add_argument("--motor-position-deg", type=float,
+                               help="command ZE300 absolute position in degrees")
+    motor_command.add_argument("--motor-relative-deg", type=float,
+                               help="command ZE300 relative motion in degrees")
+    parser.add_argument("--motor-port", default=DEFAULT_MOTOR_PORT)
+    parser.add_argument("--motor-address", type=int, default=1)
+    parser.add_argument("--motor-baud", type=int, default=115200)
     axis_group = parser.add_mutually_exclusive_group()
     axis_group.add_argument(
         "--motor-axis-parallel",
@@ -1876,6 +1929,88 @@ def add_motion_arguments(parser):
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--no-record", action="store_true",
+                        help="discard this command's plan and execution files")
+
+
+def wrist3_zero_trajectory(joint_positions):
+    start = np.asarray(joint_positions, dtype=float)
+    if start.shape != (len(JOINT_NAMES),) or not np.isfinite(start).all():
+        raise ValueError("six finite joint positions are required")
+    target = start.copy()
+    target[JOINT_NAMES.index("wrist_3_joint")] = 0.0
+    duration = max(2.0, abs(start[-1]) / PLANNED_JOINT_SPEED_LIMIT_RAD_S * 2.0)
+    trajectory = JointTrajectory()
+    trajectory.header.frame_id = "base"
+    trajectory.joint_names = list(JOINT_NAMES)
+    for positions, time_s in ((start, 0.0), (target, duration)):
+        point = JointTrajectoryPoint()
+        point.positions = positions.tolist()
+        point.velocities = [0.0] * len(JOINT_NAMES)
+        point.accelerations = [0.0] * len(JOINT_NAMES)
+        set_duration(point.time_from_start, time_s)
+        trajectory.points.append(point)
+    return trajectory
+
+
+def hold_wrist3_zero(trajectory):
+    index = list(trajectory.joint_names).index("wrist_3_joint")
+    for point in trajectory.points:
+        point.positions[index] = 0.0
+        if point.velocities:
+            point.velocities[index] = 0.0
+        if point.accelerations:
+            point.accelerations[index] = 0.0
+
+
+def run_wrist3_zero(execute):
+    rclpy.init()
+    node = MagnetTrajectoryNode()
+    try:
+        node.wait_for_fresh_state(require_execution_state=execute)
+        state = node.current_robot_state()
+        node.ceiling_guard.apply(state)
+        node.ceiling_guard.validate_state(state, "current robot state")
+        joints = dict(zip(state.joint_state.name, state.joint_state.position))
+        trajectory = wrist3_zero_trajectory([joints[name] for name in JOINT_NAMES])
+        angle_deg = math.degrees(joints["wrist_3_joint"])
+        if abs(angle_deg) <= math.degrees(WRIST3_ZERO_PLAN_TOLERANCE_RAD):
+            print(f"WRIST3_ALREADY_ZERO current={angle_deg:.3f}deg")
+            return
+        node.geometry = MagnetPathGeometry(
+            node.ceiling_guard.robot_description, node.ceiling_guard
+        )
+        node.validate_trajectory_states(trajectory, state)
+        node.validate_controller_interpolation(trajectory, state)
+        trace, joint_speed, magnet_speed, angular_speed = build_trajectory_trace(
+            trajectory, node.geometry
+        )
+        if (joint_speed > PLANNED_JOINT_SPEED_LIMIT_RAD_S
+                or angular_speed > PLANNED_TOOL_ANGULAR_SPEED_LIMIT_RAD_S
+                or magnet_speed > 0.0001):
+            raise RuntimeError("wrist3-zero path exceeds speed or magnet-centre hold limit")
+        print(f"WRIST3_ZERO_PLAN current={angle_deg:.3f}deg duration={trace[-1]['time_s']:.2f}s")
+        if not execute:
+            return
+        def monitor(_state):
+            message = node.latest_joint_state
+            actual = dict(zip(message.name, message.position))
+            node.geometry.inspect(JOINT_NAMES, [actual[name] for name in JOINT_NAMES])
+        node.execution_validator = monitor
+        solution = RobotTrajectory()
+        solution.joint_trajectory = trajectory
+        node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
+        node.execute(solution)
+        node.wait_for_fresh_state(require_execution_state=True)
+        actual = dict(zip(node.latest_joint_state.name, node.latest_joint_state.position))
+        final_deg = math.degrees(actual["wrist_3_joint"])
+        if abs(final_deg) > math.degrees(WRIST3_ZERO_PLAN_TOLERANCE_RAD):
+            raise RuntimeError(f"wrist_3_joint ended at {final_deg:.3f}deg, expected 0deg")
+        print(f"WRIST3_ZERO_SUCCESS actual={final_deg:.3f}deg")
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def parse_arguments(arguments):
@@ -1889,6 +2024,8 @@ def parse_arguments(arguments):
     point_target.add_argument("--target-xy-mm", nargs=2, type=float,
                               metavar=("X", "Y"),
                               help="keep the current magnet-centre Z height")
+    point_target.add_argument("--target-z-mm", type=float, metavar="Z",
+                              help="keep the current magnet-centre X and Y")
     add_motion_arguments(point)
 
     square = subparsers.add_parser("square", help="trace a closed XY square")
@@ -1920,11 +2057,20 @@ def parse_arguments(arguments):
     plot = subparsers.add_parser("plot", help="plot a saved plan or measured JSONL")
     plot.add_argument("--input", type=Path, required=True)
     plot.add_argument("--output", type=Path)
+    wrist3 = subparsers.add_parser("wrist3-zero", help="rotate only wrist 3 to 0 degrees; no data recorded")
+    wrist3.add_argument("--execute", action="store_true")
     return parser.parse_args(arguments)
 
 
 def requested_targets(arguments):
     if arguments.command == "point":
+        if arguments.target_z_mm is not None:
+            if not math.isfinite(arguments.target_z_mm):
+                raise ValueError("target Z must be finite")
+            return [np.asarray([arguments.target_z_mm / 1000.0])], {
+                "shape": "point", "target_world_z_mm": arguments.target_z_mm,
+                "xy": "current_magnet_xy",
+            }
         if arguments.target_xy_mm is not None:
             xy = np.asarray(arguments.target_xy_mm, dtype=float)
             if not np.isfinite(xy).all():
@@ -1955,10 +2101,9 @@ def requested_targets(arguments):
     raise ValueError(f"unsupported motion command: {arguments.command}")
 
 
-def default_output_directory(command):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
-    return data_home / "ur3" / "trajectory_runs" / f"{stamp}_{command}"
+def default_output_directory(execute):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return project_root() / ("experiments" if execute else "plans") / stamp
 
 
 def trajectory_points_for_report(trajectory):
@@ -1982,9 +2127,30 @@ def main(args=None):
         result = plot_trajectory(parsed.input, output)
         print(result)
         return
+    if parsed.command == "wrist3-zero":
+        run_wrist3_zero(parsed.execute)
+        return
 
-    if not math.isfinite(parsed.speed_mm_s) or not 5.0 <= parsed.speed_mm_s <= 20.0:
-        raise SystemExit("speed must be within [5, 20] mm/s")
+    if not math.isfinite(parsed.speed_mm_s) or not 0.0 <= parsed.speed_mm_s <= 20.0:
+        raise SystemExit("speed must be within [0, 20] mm/s")
+    if parsed.speed_mm_s == 0.0:
+        if any(value is not None for value in (
+            parsed.motor_rpm, parsed.motor_position_deg, parsed.motor_relative_deg
+        )):
+            raise SystemExit("0 mm/s holds the arm; use ze300_motor for motor-only commands")
+        print("ROBOT_HOLD: 0 mm/s, no movement command sent")
+        return
+    if parsed.motor_rpm is not None and (
+        not math.isfinite(parsed.motor_rpm)
+        or not -(2 ** 31) <= round(parsed.motor_rpm * 100) < 2 ** 31
+    ):
+        raise SystemExit("motor rpm exceeds the ZE300 protocol range")
+    for degrees in (parsed.motor_position_deg, parsed.motor_relative_deg):
+        if degrees is not None:
+            try:
+                position_counts(degrees)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
     if parsed.planning_chunk_mm is not None and (
         not math.isfinite(parsed.planning_chunk_mm)
         or not MIN_PLANNING_CHUNK_M * 1000.0
@@ -2035,13 +2201,35 @@ def main(args=None):
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise SystemExit(str(error)) from error
 
-    output = (parsed.output or default_output_directory(parsed.command)).resolve()
+    if parsed.no_record and parsed.output is not None:
+        raise SystemExit("--no-record cannot be combined with --output")
+    temporary_output = tempfile.TemporaryDirectory(prefix="ur3-no-record-") if parsed.no_record else None
+    output = (
+        Path(temporary_output.name) / "run"
+        if temporary_output is not None
+        else (parsed.output or default_output_directory(parsed.execute)).resolve()
+    )
     try:
         output.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
         raise SystemExit(f"refusing to overwrite existing output directory: {output}") from error
 
     root = project_root()
+    with (root / "config" / "ur3_system.yaml").open(encoding="utf-8") as stream:
+        motor_calibration = yaml.safe_load(stream)["calibration"]
+    phase_sign = motor_calibration.get("motor_phase_sign")
+    encoder_turns_per_magnet_turn = motor_calibration.get("motor_encoder_turns_per_magnet_turn")
+    zero_angle_rad = motor_calibration.get("motor_phase_zero_rad")
+    if phase_sign not in (None, -1, 1):
+        raise SystemExit("calibration.motor_phase_sign must be -1, 1, or null")
+    if encoder_turns_per_magnet_turn is not None and (
+        not isinstance(encoder_turns_per_magnet_turn, (int, float))
+        or not math.isfinite(encoder_turns_per_magnet_turn)
+        or encoder_turns_per_magnet_turn <= 0
+    ):
+        raise SystemExit("calibration.motor_encoder_turns_per_magnet_turn must be positive or null")
+    if zero_angle_rad is None or not math.isfinite(zero_angle_rad):
+        raise SystemExit("calibration.motor_phase_zero_rad must be a finite number")
     report = {
         "schema": PATH_SCHEMA,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -2057,7 +2245,13 @@ def main(args=None):
         "requested_tool_z_heading_deg": float(parsed.tool_z_heading_deg),
         "requested_axis_alignment_phase": parsed.axis_alignment_phase,
         "execute_requested": bool(parsed.execute),
-        "controls_motor": False,
+        "requested_motor_rpm": parsed.motor_rpm,
+        "requested_motor_position_deg": parsed.motor_position_deg,
+        "requested_motor_relative_deg": parsed.motor_relative_deg,
+        "controls_motor": bool(parsed.execute and any(value is not None for value in (
+            parsed.motor_rpm, parsed.motor_position_deg, parsed.motor_relative_deg
+        ))),
+        "motor_command_sent": False,
         "planning_chunk_requested_mm": parsed.planning_chunk_mm,
         "motion_sent": False,
         "execution_allowed_by_file": False,
@@ -2076,6 +2270,9 @@ def main(args=None):
 
     rclpy.init()
     node = None
+    motor = None
+    motor_recorder = None
+    experiment_start_ns = None
     actual_path = output / "actual_magnet_path.jsonl"
     try:
         node = MagnetTrajectoryNode()
@@ -2183,8 +2380,9 @@ def main(args=None):
             )
         if not parsed.execute:
             print("PLAN_ONLY: no command sent to the robot")
-            print(output / "plan.json")
-            print(output / "magnet_path.png")
+            if not parsed.no_record:
+                print(output / "plan.json")
+                print(output / "magnet_path.png")
             return
 
         if config_hashes(root) != report["config_sha256"]:
@@ -2197,6 +2395,35 @@ def main(args=None):
             or max(abs(value) for value in live_velocities) > 0.002
         ):
             raise RuntimeError("robot must be stationary immediately before execution")
+        experiment_start_ns = time.time_ns()
+        if report["controls_motor"]:
+            motor = ZE300Motor(parsed.motor_port, parsed.motor_address, parsed.motor_baud)
+            report["motor_status_before"] = motor.status()
+            report["motor_command_attempted"] = True
+            if parsed.motor_rpm is not None:
+                report["motor_start_reply"] = motor.speed(parsed.motor_rpm)
+                motor_command_text = f"speed={parsed.motor_rpm:.2f}rpm"
+            elif parsed.motor_position_deg is not None:
+                report["motor_start_reply"] = motor.absolute(parsed.motor_position_deg)
+                motor_command_text = f"absolute={parsed.motor_position_deg:.2f}deg"
+            else:
+                report["motor_start_reply"] = motor.relative(parsed.motor_relative_deg)
+                motor_command_text = f"relative={parsed.motor_relative_deg:.2f}deg"
+            report["motor_command_sent"] = True
+            print(f"MOTOR_COMMAND_OK {motor_command_text}")
+        else:
+            try:
+                motor = ZE300Motor(parsed.motor_port, parsed.motor_address, parsed.motor_baud)
+                report["motor_start_reply"] = motor.status()
+            except OSError as motor_error:
+                report["motor_recording_error"] = str(motor_error)
+                if motor is not None:
+                    motor.close()
+                    motor = None
+        if motor is not None:
+            motor_recorder = MotorRecorder(
+                motor, output / "motor_samples.jsonl", report["motor_start_reply"]
+            )
         node.start_actual_recording(actual_path)
         report["execution_attempted"] = True
         try:
@@ -2213,6 +2440,8 @@ def main(args=None):
             )
             report["dashboard_stop_message"] = node.dashboard_stop_message
             node.stop_actual_recording()
+            if motor_recorder is not None:
+                motor_recorder.stop()
         if not node.actual_samples:
             raise RuntimeError("execution completed without measured trajectory samples")
         final_measured = np.asarray(
@@ -2247,12 +2476,24 @@ def main(args=None):
                 )
         execution = {
             "completed": True,
+            "start_host_time_ns": experiment_start_ns,
+            "end_host_time_ns": time.time_ns(),
             "motion_sent": bool(node.execution_goal_sent),
             "dashboard_stop_attempted": bool(node.dashboard_stop_attempted),
             "dashboard_stop_succeeded": bool(node.dashboard_stop_succeeded),
             "dashboard_stop_message": node.dashboard_stop_message,
             "sample_count": len(node.actual_samples),
             "recording_error": node.recording_error,
+            "motor_recording_error": (
+                motor_recorder.error if motor_recorder is not None
+                else report.get("motor_recording_error")
+            ),
+            "magnet_orientation_calibrated": (
+                phase_sign is not None and encoder_turns_per_magnet_turn is not None
+            ),
+            "motor_phase_sign": phase_sign,
+            "motor_encoder_turns_per_magnet_turn": encoder_turns_per_magnet_turn,
+            "magnet_north_angle_at_encoder_zero_rad": zero_angle_rad,
             "final_magnet_world_mm": (final_measured * 1000.0).tolist(),
             "final_error_mm": final_error * 1000.0,
             "final_motor_axis_world": final_measured_axis.tolist(),
@@ -2267,23 +2508,89 @@ def main(args=None):
                 if node.target_tool_z_world is not None else None
             ),
         }
+        if motor is not None:
+            execution["motor_status_before"] = report.get("motor_status_before")
+            execution["motor_target_rpm"] = parsed.motor_rpm
+            execution["motor_target_position_deg"] = parsed.motor_position_deg
+            execution["motor_target_relative_deg"] = parsed.motor_relative_deg
+            try:
+                execution["motor_status"] = motor.status()
+            except OSError as status_error:
+                execution["motor_status_error"] = str(status_error)
+            if report["controls_motor"]:
+                execution["motor_output_left_enabled"] = True
+        try:
+            execution["magnet_trajectory_samples_annotated"] = add_magnet_pose(
+                actual_path,
+                motor_recorder.samples if motor_recorder is not None else [],
+                phase_sign,
+                encoder_turns_per_magnet_turn,
+                zero_angle_rad,
+            )
+        except (OSError, ValueError, KeyError) as pose_error:
+            execution["magnet_pose_error"] = str(pose_error)
+        try:
+            execution["h_robot"] = copy_h_positions(
+                output / "h_robot", experiment_start_ns, execution["end_host_time_ns"]
+            )
+        except (OSError, ValueError) as h_error:
+            execution["h_robot_error"] = str(h_error)
         write_json_exclusive(output / "execution.json", execution)
         plot_trajectory(
             output / "plan.json" if node.recording_error else output,
             output / "magnet_path.png",
         )
         print("EXECUTION_SUCCESS " + json.dumps(execution, ensure_ascii=False))
-        print(actual_path)
-        print(output / "magnet_path.png")
+        if parsed.no_record:
+            print("NO_RECORD: transient execution files discarded")
+        else:
+            print(actual_path)
+            print(output / "magnet_path.png")
     except BaseException as error:
+        if motor_recorder is not None:
+            motor_recorder.stop()
+        if motor is not None and report.get("motor_command_attempted"):
+            try:
+                motor.speed(0)
+                report["motor_stopped_after_failure"] = True
+            except (OSError, ValueError) as stop_error:
+                report["motor_stop_error"] = str(stop_error)
         if node is not None:
             node.stop_actual_recording()
             report["motion_sent"] = bool(node.execution_goal_sent)
+        if actual_path.exists():
+            try:
+                add_magnet_pose(
+                    actual_path,
+                    motor_recorder.samples if motor_recorder is not None else [],
+                    phase_sign,
+                    encoder_turns_per_magnet_turn,
+                    zero_angle_rad,
+                )
+            except (OSError, ValueError, KeyError) as pose_error:
+                report["magnet_pose_error"] = str(pose_error)
         failure = {
             "failed_utc": datetime.now(timezone.utc).isoformat(),
             "motion_sent": bool(report.get("motion_sent")),
             "error": str(error),
+            "start_host_time_ns": experiment_start_ns,
+            "end_host_time_ns": time.time_ns(),
+            "motor_command_sent": report["motor_command_sent"],
+            "motor_stopped_after_failure": report.get("motor_stopped_after_failure"),
+            "motor_stop_error": report.get("motor_stop_error"),
+            "motor_recording_error": (
+                motor_recorder.error if motor_recorder is not None
+                else report.get("motor_recording_error")
+            ),
+            "magnet_pose_error": report.get("magnet_pose_error"),
         }
+        if experiment_start_ns is not None and not (output / "h_robot").exists():
+            try:
+                failure["h_robot"] = copy_h_positions(
+                    output / "h_robot", experiment_start_ns, failure["end_host_time_ns"]
+                )
+            except (OSError, ValueError) as h_error:
+                failure["h_robot_error"] = str(h_error)
         if node is not None:
             failure.update(
                 dashboard_stop_attempted=bool(node.dashboard_stop_attempted),
@@ -2304,10 +2611,14 @@ def main(args=None):
             print(str(error), file=sys.stderr)
         raise SystemExit(1) from error
     finally:
+        if motor is not None:
+            motor.close()
         if node is not None:
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        if temporary_output is not None:
+            temporary_output.cleanup()
 
 
 if __name__ == "__main__":

@@ -8,4 +8,4 @@
 当前运行规则以根目录 `README.md`、`config/` 和代码为准。
 
 机械臂轨迹测试位于 ROS 2 包内，通用 RTDE 工具测试位于 `robot/tests/`。
-新轨迹运行记录默认写入 `~/.local/share/ur3/trajectory_runs/`。
+新轨迹运行记录默认写入 `/home/yc/UR3/experiments/`，只规划结果写入 `/home/yc/UR3/plans/`。

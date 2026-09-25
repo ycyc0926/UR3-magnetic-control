@@ -64,9 +64,13 @@ def modeled_boundary_gaps_m(table_geometry, side_geometry, lower_world, upper_wo
         raise ValueError("invalid acrylic side geometry") from error
     if not math.isfinite(left) or not math.isfinite(right) or left >= right:
         raise ValueError("invalid acrylic side geometry")
+    if side_geometry.get("model") != "parallel_yz_planes_from_acrylic_front_edge":
+        raise ValueError("invalid acrylic side extent model")
+    _, front_y = acrylic_inner_lower_left_world_xy_m(table_geometry)
+    outside_sides = upper[1] < front_y
     return {
         "ceiling": acrylic_ceiling_gap_m(table_geometry, lower, upper),
-        "left": float(lower[0]) - left,
-        "right": right - float(upper[0]),
+        "left": math.inf if outside_sides else float(lower[0]) - left,
+        "right": math.inf if outside_sides else right - float(upper[0]),
         "table": float(lower[2]),
     }

@@ -2,7 +2,7 @@
 
 The underside height guard begins at the measured world Y lower edge. Geometry
 wholly below that edge is outside the acrylic footprint; geometry touching or
-crossing it remains constrained. Side-panel guards remain global. All margins
+crossing it remains constrained. Both side panels start at the same Y edge. All margins
 come from the single project-wide clearance policy.
 """
 
@@ -46,6 +46,8 @@ def load_guard_configuration():
         encoding="utf-8"
     ) as stream:
         sides = yaml.safe_load(stream)
+    if sides.get("model") != "parallel_yz_planes_from_acrylic_front_edge":
+        raise ValueError("invalid acrylic side extent model")
     with Path(system['robot']['calibration_file']).open(encoding='utf-8') as stream:
         kinematics_hash = str(yaml.safe_load(stream)['kinematics']['hash'])
 
@@ -210,21 +212,22 @@ class AcrylicCeilingGuard:
         )
 
     def _forbidden_side_objects(self):
-        # The inner X faces encode the global 10 mm side margin. The boxes are
-        # deliberately larger than the UR3 work envelope in world Y and Z.
+        # The inner X faces encode the global 10 mm side margin. Both panels
+        # start at the measured acrylic front Y edge.
         width_m = 1.0
         extent_yz_m = 2.0
         left = self.configuration["left_guard_world_x_m"]
         right = self.configuration["right_guard_world_x_m"]
+        front_y = self.configuration["ceiling_region_min_world_y_m"]
         return [
             self._world_box(
                 LEFT_OBJECT_ID,
-                [left - width_m / 2.0, 0.0, 0.5],
+                [left - width_m / 2.0, front_y + extent_yz_m / 2.0, 0.5],
                 [width_m, extent_yz_m, extent_yz_m],
             ),
             self._world_box(
                 RIGHT_OBJECT_ID,
-                [right + width_m / 2.0, 0.0, 0.5],
+                [right + width_m / 2.0, front_y + extent_yz_m / 2.0, 0.5],
                 [width_m, extent_yz_m, extent_yz_m],
             ),
         ]

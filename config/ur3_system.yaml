@@ -51,4 +51,9 @@ calibration:
     - [-0.000176331, -0.000087231, 0.999999981, -0.016152000]
     - [0.0, 0.0, 0.0, 1.0]
   camera_robot_file: /home/yc/UR3/config/camera_robot_calibration.yaml
-  motor_phase_zero_rad: null
+  # Encoder 0 degrees: magnet N points along tool0 +X (confirmed by user).
+  motor_phase_zero_rad: 0.0
+  # Observed at +90 degrees: magnet N turns from tool0 +X toward -Y.
+  motor_phase_sign: -1
+  # Magnet is fixed directly to the motor shaft: one reported turn is one magnet turn.
+  motor_encoder_turns_per_magnet_turn: 1.0

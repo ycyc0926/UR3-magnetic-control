@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore ZE300 magnet origin after motor reconnect
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/yc/UR3/ros2_ws/src/ur3_magnetic_control/ur3_magnetic_control/ze300_motor.py watch-origin
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -24,6 +24,7 @@ setup(
             "camera_node = ur3_magnetic_control.camera_node:main",
             "h_tracker_node = ur3_magnetic_control.h_tracker_node:main",
             "magnet_trajectory = ur3_magnetic_control.magnet_trajectory:main",
+            "ze300_motor = ur3_magnetic_control.ze300_motor:main",
         ],
     },
 )

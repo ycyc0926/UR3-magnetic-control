@@ -28,6 +28,7 @@ from ur3_magnetic_control.magnet_trajectory import (
     build_point_targets,
     build_square_targets,
     horizontal_tool_z_target_rotation,
+    hold_wrist3_zero,
     concatenate_joint_trajectories,
     joint_state_sample_time,
     load_waypoint_targets,
@@ -47,6 +48,7 @@ from ur3_magnetic_control.magnet_trajectory import (
     table_parallel_target_rotation,
     trace_from_jsonl,
     validate_route,
+    wrist3_zero_trajectory,
 )
 from ur3_magnetic_control.cartesian_line_move import (
     CartesianLineMove,
@@ -65,17 +67,42 @@ class TargetGenerationTests(unittest.TestCase):
         np.testing.assert_allclose(points, [[0.125, 0.030, 0.450]])
         self.assertEqual(metadata["shape"], "point")
 
-    def test_xy_target_keeps_current_height_and_defaults_to_ten_mm_s(self):
+    def test_xy_target_keeps_current_height_and_defaults_to_five_mm_s(self):
         parsed = parse_arguments(["point", "--target-xy-mm", "88", "148"])
-        self.assertEqual(parsed.speed_mm_s, 10.0)
+        self.assertEqual(parsed.speed_mm_s, 5.0)
         targets, metadata = requested_targets(parsed)
         np.testing.assert_allclose(resolve_target_height(targets, 0.4),
                                    [[0.088, 0.148, 0.4]])
         self.assertEqual(metadata["height"], "current_magnet_z")
-        for speed in (4.9, 20.1):
-            with self.subTest(speed=speed), self.assertRaisesRegex(SystemExit, r"\[5, 20\]"):
+        for speed in (-0.1, 20.1):
+            with self.subTest(speed=speed), self.assertRaisesRegex(SystemExit, r"\[0, 20\]"):
                 main(["point", "--target-xy-mm", "88", "148",
                       "--speed-mm-s", str(speed)])
+        self.assertIsNone(main(["point", "--target-xy-mm", "88", "148",
+                                "--speed-mm-s", "0", "--execute"]))
+
+    def test_z_target_keeps_current_xy(self):
+        parsed = parse_arguments(["point", "--target-z-mm", "350", "--no-record"])
+        self.assertTrue(parsed.no_record)
+        targets, metadata = requested_targets(parsed)
+        np.testing.assert_allclose(resolve_target_height(targets, [0.123, 0.146, 0.4]),
+                                   [[0.123, 0.146, 0.35]])
+        self.assertEqual(metadata["xy"], "current_magnet_xy")
+
+    def test_wrist3_zero_moves_only_last_joint(self):
+        path = wrist3_zero_trajectory([1, 2, 3, 4, 5, math.radians(10)])
+        np.testing.assert_allclose(path.points[0].positions, [1, 2, 3, 4, 5, math.radians(10)])
+        np.testing.assert_allclose(path.points[-1].positions, [1, 2, 3, 4, 5, 0])
+        self.assertGreater(duration_seconds(path.points[-1].time_from_start), 3.7)
+
+    def test_hold_wrist3_zero_keeps_other_joints_and_derivatives(self):
+        path = wrist3_zero_trajectory([1, 2, 3, 4, 5, math.radians(10)])
+        hold_wrist3_zero(path)
+        for point in path.points:
+            self.assertEqual(point.positions[-1], 0.0)
+            self.assertEqual(point.velocities[-1], 0.0)
+            self.assertEqual(point.accelerations[-1], 0.0)
+            self.assertEqual(list(point.positions[:5]), [1, 2, 3, 4, 5])
 
     def test_square_is_closed_and_has_requested_geometry(self):
         points, metadata = build_square_targets(
@@ -402,7 +429,7 @@ class ExecutionGateTests(unittest.TestCase):
     def test_live_monitor_records_motion_and_propagates_boundary_failure(self):
         checked = {"magnet_world_mm": [100.0, 20.0, 300.0]}
         geometry = SimpleNamespace(inspect=lambda names, positions: checked)
-        message = JointState(name=list(JOINT_NAMES), position=[100.0] * 6)
+        message = JointState(name=list(JOINT_NAMES), position=[100.0] * 5 + [0.0])
         runner = SimpleNamespace(
             robot_program_running=True,
             joint_state_received_at=time.monotonic(),
@@ -416,6 +443,7 @@ class ExecutionGateTests(unittest.TestCase):
             table_parallel_start_world=None,
             table_parallel_mode=None,
             table_parallel_ready=False,
+            tool_orientation_reference_world=None,
         )
         MagnetTrajectoryNode.monitor_execution_state(runner, RobotState())
         self.assertEqual(runner.actual_samples[0]["magnet_world_mm"], checked["magnet_world_mm"])
@@ -565,6 +593,7 @@ class CurrentGeometryRegressionTests(unittest.TestCase):
             1.7700637578964233,
         ]
         result = geometry.inspect(JOINT_NAMES, joints)
+        self.assertEqual(len(result["tool0_world_mm"]), 3)
         np.testing.assert_allclose(
             result["magnet_world_mm"],
             [186.435347, 37.991101, 434.475648],
