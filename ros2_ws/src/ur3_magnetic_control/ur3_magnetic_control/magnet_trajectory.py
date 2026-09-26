@@ -20,6 +20,8 @@ provisional because cables and some bracket details have not been measured.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from contextlib import ExitStack
 import copy
 import csv
 from datetime import datetime, timezone
@@ -29,7 +31,6 @@ import math
 import os
 from pathlib import Path
 import sys
-import tempfile
 import time
 
 import numpy as np
@@ -58,8 +59,9 @@ from .cartesian_line_move import (
 )
 from .ceiling_geometry import CeilingGeometry, sample_trajectory
 from .clearance_policy import load_clearance_limits_m
-from .experiment_data import MotorRecorder, add_magnet_pose, copy_h_positions
-from .ze300_motor import DEFAULT_PORT as DEFAULT_MOTOR_PORT, ZE300Motor, position_counts
+from .experiment_data import MotorRecorder, active_experiment, add_magnet_pose
+from .motion_startup import ensure_external_control, prepare_motion_stack
+from .ze300_motor import DEFAULT_PORT as DEFAULT_MOTOR_PORT, ZE300Motor, position_counts, restore_origin
 
 
 JOINT_NAMES = (
@@ -74,7 +76,7 @@ TOOL_OBJECT_ID = "provisional_complete_magnet_tool"
 TABLE_OBJECT_ID = "table_clearance_forbidden"
 PATH_SCHEMA = "ur3_magnet_centre_path/v1"
 MAX_CARTESIAN_STEP_M = 0.002
-MAX_SEGMENT_M = 0.300
+MAX_SEGMENT_M = 0.400
 MAX_TOTAL_PATH_M = 1.000
 MAX_TARGETS = 600
 MAX_DURATION_S = 300.0
@@ -514,7 +516,7 @@ def validate_route(start_world, targets_world):
     segments = [float(np.linalg.norm(right - left))
                 for left, right in zip(route, route[1:])]
     if any(length > MAX_SEGMENT_M for length in segments):
-        raise ValueError("a path segment exceeds the 300 mm limit")
+        raise ValueError(f"a path segment exceeds the {MAX_SEGMENT_M * 1000:.0f} mm limit")
     total = sum(segments)
     if total <= 1.0e-6 or total > MAX_TOTAL_PATH_M:
         raise ValueError("total path length must be within (1, 1000] mm")
@@ -1028,7 +1030,14 @@ class MagnetTrajectoryNode(CartesianLineMove):
             )
             if state_is_fresh and execution_state_is_ready:
                 return
-        raise RuntimeError("timed out waiting for fresh robot state")
+        joint_age = (None if self.joint_state_received_at is None
+                     else round(time.monotonic() - self.joint_state_received_at, 3))
+        raise RuntimeError(
+            "timed out waiting for fresh robot state "
+            f"(require_execution_state={require_execution_state}, "
+            f"joint_age_s={joint_age}, program_running={self.robot_program_running}, "
+            f"speed_scaling={self.speed_scaling_percent})"
+        )
 
     def validate_controller_interpolation(self, trajectory, start_state):
         """Collision-check interior points of every controller spline segment."""
@@ -1653,10 +1662,11 @@ class MagnetTrajectoryNode(CartesianLineMove):
             "final_error_mm": final_error * 1000.0,
         }
 
-    def start_actual_recording(self, path: Path):
-        self.actual_stream = Path(path).open("x", encoding="utf-8", buffering=1)
+    def start_actual_recording(self, path: Path | None):
+        self.actual_stream = Path(path).open("x", encoding="utf-8", buffering=1) if path is not None else None
         self.recording_error = None
-        self.actual_samples = []
+        # No-file mode keeps only the latest measurement for safety/final checks.
+        self.actual_samples = [] if path is not None else deque(maxlen=1)
         self.last_logged_state_time = None
         self.table_parallel_ready = False
         self.execution_validator = self.monitor_execution_state
@@ -1858,7 +1868,7 @@ def add_motion_arguments(parser):
     parser.add_argument("--speed-mm-s", type=float, default=5.0)
     motor_command = parser.add_mutually_exclusive_group()
     motor_command.add_argument("--motor-rpm", type=float,
-                               help="start ZE300 rotation before robot motion")
+                               help="rotate in rpm (negative=reverse); stop and return to saved origin after success")
     motor_command.add_argument("--motor-position-deg", type=float,
                                help="command ZE300 absolute position in degrees")
     motor_command.add_argument("--motor-relative-deg", type=float,
@@ -1928,9 +1938,13 @@ def add_motion_arguments(parser):
         ),
     )
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--no-record", action="store_true",
-                        help="discard this command's plan and execution files")
+    parser.add_argument("--execute", action="store_true",
+                        help="automatically prepare motion services and External Control, then execute")
+    recording = parser.add_mutually_exclusive_group()
+    recording.add_argument("--no", nargs="?", const="all", choices=("all", "camera"),
+                           help="write no data; '--no camera' is retained for compatibility (camera files require web recording)")
+    recording.add_argument("--no-record", action="store_true",
+                           help="alias for --no: write no data files")
 
 
 def wrist3_zero_trajectory(joint_positions):
@@ -1967,7 +1981,8 @@ def run_wrist3_zero(execute):
     rclpy.init()
     node = MagnetTrajectoryNode()
     try:
-        node.wait_for_fresh_state(require_execution_state=execute)
+        prepare_motion_stack(node, project_root(), no_record=True)
+        node.wait_for_fresh_state()
         state = node.current_robot_state()
         node.ceiling_guard.apply(state)
         node.ceiling_guard.validate_state(state, "current robot state")
@@ -1999,6 +2014,7 @@ def run_wrist3_zero(execute):
         node.execution_validator = monitor
         solution = RobotTrajectory()
         solution.joint_trajectory = trajectory
+        ensure_external_control(node)
         node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
         node.execute(solution)
         node.wait_for_fresh_state(require_execution_state=True)
@@ -2059,7 +2075,13 @@ def parse_arguments(arguments):
     plot.add_argument("--output", type=Path)
     wrist3 = subparsers.add_parser("wrist3-zero", help="rotate only wrist 3 to 0 degrees; no data recorded")
     wrist3.add_argument("--execute", action="store_true")
-    return parser.parse_args(arguments)
+    parsed = parser.parse_args(arguments)
+    if hasattr(parsed, "no_record"):
+        parsed.no_record = parsed.no_record or parsed.no == "all"
+        parsed.no_camera = parsed.no_record or parsed.no == "camera"
+        if parsed.no_record and parsed.output is not None:
+            parser.error("--no / --no-record cannot be combined with --output")
+    return parsed
 
 
 def requested_targets(arguments):
@@ -2201,18 +2223,13 @@ def main(args=None):
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise SystemExit(str(error)) from error
 
-    if parsed.no_record and parsed.output is not None:
-        raise SystemExit("--no-record cannot be combined with --output")
-    temporary_output = tempfile.TemporaryDirectory(prefix="ur3-no-record-") if parsed.no_record else None
-    output = (
-        Path(temporary_output.name) / "run"
-        if temporary_output is not None
-        else (parsed.output or default_output_directory(parsed.execute)).resolve()
-    )
-    try:
-        output.mkdir(parents=True, exist_ok=False)
-    except FileExistsError as error:
-        raise SystemExit(f"refusing to overwrite existing output directory: {output}") from error
+    output = None
+    if not parsed.no_record:
+        output = (parsed.output or default_output_directory(parsed.execute)).resolve()
+        try:
+            output.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as error:
+            raise SystemExit(f"refusing to overwrite existing output directory: {output}") from error
 
     root = project_root()
     with (root / "config" / "ur3_system.yaml").open(encoding="utf-8") as stream:
@@ -2268,17 +2285,21 @@ def main(args=None):
         ],
     }
 
-    rclpy.init()
+    rclpy.init(args=["--ros-args", "--disable-external-lib-logs"] if parsed.no_record else None)
     node = None
     motor = None
     motor_recorder = None
     experiment_start_ns = None
-    actual_path = output / "actual_magnet_path.jsonl"
+    actual_path = output / "actual_magnet_path.jsonl" if output is not None else None
+    camera_context = ExitStack()
     try:
+        if parsed.execute and output is not None:
+            camera_context.enter_context(active_experiment(output))
         node = MagnetTrajectoryNode()
-        node.wait_for_fresh_state(
-            timeout=5.0, require_execution_state=parsed.execute
-        )
+        prepare_motion_stack(node, root, no_record=parsed.no_record)
+        # Running-state feedback may first appear after External Control is played.
+        # Planning needs fresh joints; execution feedback is checked after Play.
+        node.wait_for_fresh_state(timeout=5.0)
         velocities = list(node.latest_joint_state.velocity)
         if velocities and (
             len(velocities) != len(node.latest_joint_state.position)
@@ -2324,12 +2345,11 @@ def main(args=None):
         # Keep the trace at top level so the plotting command can consume a
         # plan without knowing how the rest of the report is organized.
         report["planned_trace"] = planned_trace
-        node.wait_for_fresh_state(
-            timeout=2.0, require_execution_state=parsed.execute
-        )
+        node.wait_for_fresh_state(timeout=2.0)
         report["start_mismatch_rad"] = node.verify_start(trajectory)
-        write_json_exclusive(output / "plan.json", report)
-        plot_trajectory(output / "plan.json", output / "magnet_path.png")
+        if output is not None:
+            write_json_exclusive(output / "plan.json", report)
+            plot_trajectory(output / "plan.json", output / "magnet_path.png")
         print(
             "PLAN_OK "
             f"shape={parsed.command} fraction={planning['fraction']:.6f} "
@@ -2387,7 +2407,9 @@ def main(args=None):
 
         if config_hashes(root) != report["config_sha256"]:
             raise RuntimeError("configuration files changed after planning")
+        ensure_external_control(node)
         node.wait_for_fresh_state(timeout=2.0, require_execution_state=True)
+        node.verify_start(trajectory)
         live_velocities = list(node.latest_joint_state.velocity)
         if (
             not live_velocities
@@ -2411,7 +2433,7 @@ def main(args=None):
                 motor_command_text = f"relative={parsed.motor_relative_deg:.2f}deg"
             report["motor_command_sent"] = True
             print(f"MOTOR_COMMAND_OK {motor_command_text}")
-        else:
+        elif not parsed.no_record:
             try:
                 motor = ZE300Motor(parsed.motor_port, parsed.motor_address, parsed.motor_baud)
                 report["motor_start_reply"] = motor.status()
@@ -2420,7 +2442,7 @@ def main(args=None):
                 if motor is not None:
                     motor.close()
                     motor = None
-        if motor is not None:
+        if motor is not None and output is not None:
             motor_recorder = MotorRecorder(
                 motor, output / "motor_samples.jsonl", report["motor_start_reply"]
             )
@@ -2442,6 +2464,9 @@ def main(args=None):
             node.stop_actual_recording()
             if motor_recorder is not None:
                 motor_recorder.stop()
+        if report["controls_motor"]:
+            # The recorder must release the serial port before sending commands.
+            motor.speed(0)
         if not node.actual_samples:
             raise RuntimeError("execution completed without measured trajectory samples")
         final_measured = np.asarray(
@@ -2513,36 +2538,35 @@ def main(args=None):
             execution["motor_target_rpm"] = parsed.motor_rpm
             execution["motor_target_position_deg"] = parsed.motor_position_deg
             execution["motor_target_relative_deg"] = parsed.motor_relative_deg
+            if report["controls_motor"]:
+                print("MOTOR_RETURNING_TO_ORIGIN: waiting for stop, then shortest rotation", flush=True)
+                execution["motor_return_to_origin"] = restore_origin(motor)
+                print("MOTOR_HOME_OK " + json.dumps(execution["motor_return_to_origin"], ensure_ascii=False))
             try:
                 execution["motor_status"] = motor.status()
             except OSError as status_error:
                 execution["motor_status_error"] = str(status_error)
             if report["controls_motor"]:
-                execution["motor_output_left_enabled"] = True
-        try:
-            execution["magnet_trajectory_samples_annotated"] = add_magnet_pose(
-                actual_path,
-                motor_recorder.samples if motor_recorder is not None else [],
-                phase_sign,
-                encoder_turns_per_magnet_turn,
-                zero_angle_rad,
+                execution["motor_output_left_enabled"] = bool(execution["motor_return_to_origin"]["enabled"])
+        if output is not None:
+            try:
+                execution["magnet_trajectory_samples_annotated"] = add_magnet_pose(
+                    actual_path,
+                    motor_recorder.samples if motor_recorder is not None else [],
+                    phase_sign,
+                    encoder_turns_per_magnet_turn,
+                    zero_angle_rad,
+                )
+            except (OSError, ValueError, KeyError) as pose_error:
+                execution["magnet_pose_error"] = str(pose_error)
+            write_json_exclusive(output / "execution.json", execution)
+            plot_trajectory(
+                output / "plan.json" if node.recording_error else output,
+                output / "magnet_path.png",
             )
-        except (OSError, ValueError, KeyError) as pose_error:
-            execution["magnet_pose_error"] = str(pose_error)
-        try:
-            execution["h_robot"] = copy_h_positions(
-                output / "h_robot", experiment_start_ns, execution["end_host_time_ns"]
-            )
-        except (OSError, ValueError) as h_error:
-            execution["h_robot_error"] = str(h_error)
-        write_json_exclusive(output / "execution.json", execution)
-        plot_trajectory(
-            output / "plan.json" if node.recording_error else output,
-            output / "magnet_path.png",
-        )
         print("EXECUTION_SUCCESS " + json.dumps(execution, ensure_ascii=False))
         if parsed.no_record:
-            print("NO_RECORD: transient execution files discarded")
+            print("NO_RECORD: no data files written")
         else:
             print(actual_path)
             print(output / "magnet_path.png")
@@ -2558,7 +2582,7 @@ def main(args=None):
         if node is not None:
             node.stop_actual_recording()
             report["motion_sent"] = bool(node.execution_goal_sent)
-        if actual_path.exists():
+        if actual_path is not None and actual_path.exists():
             try:
                 add_magnet_pose(
                     actual_path,
@@ -2584,23 +2608,17 @@ def main(args=None):
             ),
             "magnet_pose_error": report.get("magnet_pose_error"),
         }
-        if experiment_start_ns is not None and not (output / "h_robot").exists():
-            try:
-                failure["h_robot"] = copy_h_positions(
-                    output / "h_robot", experiment_start_ns, failure["end_host_time_ns"]
-                )
-            except (OSError, ValueError) as h_error:
-                failure["h_robot_error"] = str(h_error)
         if node is not None:
             failure.update(
                 dashboard_stop_attempted=bool(node.dashboard_stop_attempted),
                 dashboard_stop_succeeded=bool(node.dashboard_stop_succeeded),
                 dashboard_stop_message=node.dashboard_stop_message,
             )
-        failure_path = output / "failure.json"
-        if not failure_path.exists():
-            write_json_exclusive(failure_path, failure)
-        if actual_path.exists() and actual_path.stat().st_size:
+        if output is not None:
+            failure_path = output / "failure.json"
+            if not failure_path.exists():
+                write_json_exclusive(failure_path, failure)
+        if actual_path is not None and actual_path.exists() and actual_path.stat().st_size:
             try:
                 plot_trajectory(output, output / "magnet_path.png")
             except Exception:
@@ -2611,14 +2629,13 @@ def main(args=None):
             print(str(error), file=sys.stderr)
         raise SystemExit(1) from error
     finally:
+        camera_context.close()
         if motor is not None:
             motor.close()
         if node is not None:
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        if temporary_output is not None:
-            temporary_output.cleanup()
 
 
 if __name__ == "__main__":

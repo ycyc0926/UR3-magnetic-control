@@ -17,6 +17,8 @@ camera_node:
 
 h_tracker:
   ros__parameters:
+    # Consecutive unique, position-consistent frames required after target loss.
+    reacquire_frames: 3
     # Five-frame median center motion at or above this value keeps the clip.
     recording_movement_threshold_mm: 0.5
     # Static deletion requires reliable tracking; lower coverage is kept as indeterminate.

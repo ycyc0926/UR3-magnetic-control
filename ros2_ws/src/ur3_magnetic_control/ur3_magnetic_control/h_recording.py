@@ -66,16 +66,21 @@ class BoundedRecorder:
         self.positions = []
         self.discontinuities = []
 
-    def start(self, duration_s=120.0):
+    def start(self, duration_s=120.0, session=None):
         if not np.isfinite(duration_s) or not 5 <= duration_s <= 180:
             raise ValueError('Recording duration must be 5--180 s')
         if self.active:
             raise RuntimeError('A recording is already active')
-        if shutil.disk_usage(self.session).free < self.reserve_bytes:
+        destination = self.session if session is None else Path(session)
+        storage = destination
+        while not storage.exists():
+            storage = storage.parent
+        if shutil.disk_usage(storage).free < self.reserve_bytes:
             raise RuntimeError('Less than reserved free disk space')
+        self.session = destination
         self.clip_name = 'clip_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         self.directory = self.session/self.clip_name
-        self.directory.mkdir(exist_ok=False)
+        self.directory.mkdir(parents=True, exist_ok=False)
         self.log = (self.directory/'frame_times.csv').open('x', newline='', encoding='utf-8')
         self.csv = csv.writer(self.log)
         self.csv.writerow(['video_frame_index', 'host_frame_time_ns', 'receipt_wall_time_ns',
@@ -101,7 +106,7 @@ class BoundedRecorder:
         self._save_metadata()
 
     def mark_tracking_discontinuity(self):
-        """Prevent a manual target reselection from looking like center motion."""
+        """Prevent manual/automatic target reacquisition from looking like motion."""
         if self.active and (not self.discontinuities or self.discontinuities[-1] != self.frames):
             self.discontinuities.append(self.frames)
 

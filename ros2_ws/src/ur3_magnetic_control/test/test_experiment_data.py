@@ -1,34 +1,43 @@
-import csv
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 
-from ur3_magnetic_control.experiment_data import add_magnet_pose, copy_h_positions
+from ur3_magnetic_control.experiment_data import active_experiment, current_experiment, add_magnet_pose
 
 
-def test_copies_only_frames_during_experiment():
+def test_active_experiment_exists_only_while_producer_holds_lock():
     with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        session = root / "tracking_sessions" / "session"
-        session.mkdir(parents=True)
-        with (session / "positions.csv").open("w", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(["host_frame_time_ns", "detected", "world_x_mm"])
-            writer.writerows([(100, 1, 1), (200, 0, ""), (300, 1, 3), (400, 1, 4)])
-        output = root / "experiment" / "h_robot"
-        result = copy_h_positions(output, 150, 350, source_session=session)
-        assert result["rows"] == 2
-        assert result["detected_rows"] == 1
-        with (output / "positions.csv").open(newline="") as stream:
-            rows = list(csv.DictReader(stream))
-        assert [row["host_frame_time_ns"] for row in rows] == ["200", "300"]
-        assert json.loads((output / "metadata.json").read_text())["rows"] == 2
-        (session / "status.json").write_text("{}")
-        automatic = copy_h_positions(
-            root / "automatic" / "h_robot", 150, 350,
-            sessions=root / "tracking_sessions",
-        )
-        assert automatic["rows"] == 2
+        experiment = Path(directory)/'run'
+        experiment.mkdir()
+        context_file = Path(directory)/'active'
+        assert current_experiment(context_file) is None
+        try:
+            with active_experiment(experiment, context_file):
+                assert current_experiment(context_file) == experiment
+                try:
+                    with active_experiment(experiment, context_file):
+                        raise AssertionError('Competing experiment was allowed')
+                except RuntimeError:
+                    pass
+                assert current_experiment(context_file) == experiment
+                raise ValueError('Simulated experiment failure')
+        except ValueError:
+            pass
+        assert current_experiment(context_file) is None
+        assert context_file.read_text() == ''
+        # A hard exit leaves the path behind, but the OS releases its lock.
+        subprocess.run([sys.executable, '-c',
+                        'import os, sys; from pathlib import Path; '
+                        'from ur3_magnetic_control.experiment_data import active_experiment; '
+                        'context = active_experiment(sys.argv[1], Path(sys.argv[2])); '
+                        'context.__enter__(); os._exit(0)',
+                        str(experiment), str(context_file)], check=True)
+        assert context_file.read_text() == str(experiment)
+        assert current_experiment(context_file) is None
+        with active_experiment(experiment, context_file):
+            assert current_experiment(context_file) == experiment
 
 
 def test_magnet_pose_interpolates_encoder_without_claiming_unknown_magnet_angle():

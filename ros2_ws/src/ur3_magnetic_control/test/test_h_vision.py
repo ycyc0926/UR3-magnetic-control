@@ -13,7 +13,7 @@ import numpy as np
 
 from ur3_magnetic_control.h_preview_web import LocalPreview, PAGE
 from ur3_magnetic_control.h_recording import BoundedRecorder
-from ur3_magnetic_control.h_tracking import DarkTargetTracker, PlaneMapper, reference_path
+from ur3_magnetic_control.h_tracking import DarkTargetTracker, PlaneMapper
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -43,42 +43,115 @@ class ProjectionTests(unittest.TestCase):
         actual, _ = self.mapper.project(full, (2448, 2048))
         np.testing.assert_allclose(xy, actual, atol=1e-12)
 
-    def test_reference_square_and_line(self):
-        start = [.2, .1]
-        square = reference_path('square', start, 20)
-        np.testing.assert_allclose(square[-1], start)
-        np.testing.assert_allclose(np.linalg.norm(np.diff(square, axis=0), axis=1), .02)
-        np.testing.assert_allclose(square[1]-square[0], [0, .02])
-        self.assertEqual(reference_path('line', start, 10).shape, (2, 2))
-        np.testing.assert_allclose(reference_path('line_negative_y', start, 10)[1]-start, [0, -.01])
-
-    def test_bad_reference_rejected(self):
-        for size in [float('nan'), 0, 100]:
-            with self.assertRaises(ValueError): reference_path('square', [0, 0], size)
-        with self.assertRaises(ValueError):reference_path('robot_move', [0, 0], 20)
-
 
 class TrackerTests(unittest.TestCase):
-    def test_diagnostics_and_lockout_unchanged(self):
+    def test_only_contours_touching_the_image_boundary_are_rejected(self):
+        for gap in (1, 0, -5):
+            left, right = 18+gap, 639-18-gap
+            top, bottom = 25+gap, 479-25-gap
+            centers = [(left, 240), (right, 240), (320, top), (320, bottom),
+                       (left, top), (left, bottom), (right, top), (right, bottom)]
+            for center in centers:
+                with self.subTest(gap=gap, center=center):
+                    tracker = DarkTargetTracker()
+                    tracker.reset(center)
+                    result = tracker.detect(frame(center))
+                    if gap > 0:
+                        self.assertIsNotNone(result)
+                        np.testing.assert_allclose(result['pixel'], center, atol=.1)
+                    else:
+                        self.assertIsNone(result)
+                        self.assertGreater(tracker.diagnostics['rejected']['shape_or_border'], 0)
+
+    def test_reacquires_after_long_loss_without_clicking(self):
         tracker = DarkTargetTracker()
         self.assertIsNotNone(tracker.detect(frame()))
         self.assertEqual(tracker.diagnostics['reason'], 'tracked')
         blank = np.full((480, 640, 3), 220, np.uint8)
         for i in range(5):self.assertIsNone(tracker.detect(blank))
-        self.assertTrue(tracker.locked_out)
-        self.assertIsNone(tracker.detect(frame()))
-        self.assertEqual(tracker.diagnostics['reason'], 'locked_out')
-        tracker.reset((320, 240))
-        self.assertIsNotNone(tracker.detect(frame()))
+        for count in (1, 2):
+            self.assertIsNone(tracker.detect(frame((620, 240))))
+            self.assertEqual(tracker.diagnostics['reason'], 'reacquiring')
+            self.assertEqual(tracker.diagnostics['confirmation_frames'], count)
+            np.testing.assert_allclose(tracker.last, (320, 240), atol=.1)
+        result = tracker.detect(frame((620, 240)))
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result['pixel'], (620, 240), atol=.1)
+        self.assertEqual(tracker.diagnostics['reason'], 'reacquired')
+        self.assertIsNotNone(tracker.detect(frame((610, 240))))
+        self.assertEqual(tracker.diagnostics['reason'], 'tracked')
 
     def test_jump_is_rejected_and_recorded(self):
         tracker = DarkTargetTracker()
         tracker.detect(frame())
         self.assertIsNone(tracker.detect(frame((400, 240))))
         self.assertGreater(tracker.diagnostics['rejected']['distance'], 0)
+        for center in ((410, 240), (420, 240)):
+            self.assertIsNone(tracker.detect(frame(center)))
+        result = tracker.detect(frame((430, 240)))
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result['pixel'], (430, 240), atol=.1)
+
+    def test_reacquisition_requires_unique_continuous_fresh_observations(self):
+        for interruption in ('multiple', 'blank', 'jump', 'stream_timeout'):
+            with self.subTest(interruption=interruption):
+                tracker = DarkTargetTracker()
+                tracker.detect(frame())
+                self.assertIsNone(tracker.detect(frame((500, 240))))
+                for _ in range(2):self.assertIsNone(tracker.detect(frame((500, 240))))
+                if interruption == 'stream_timeout':
+                    tracker.mark_lost()
+                elif interruption == 'blank':
+                    self.assertIsNone(tracker.detect(np.full((480, 640, 3), 220, np.uint8)))
+                elif interruption == 'jump':
+                    self.assertIsNone(tracker.detect(frame((100, 240))))
+                    self.assertEqual(tracker.diagnostics['confirmation_frames'], 1)
+                else:
+                    multiple = np.minimum(frame((330, 240)), frame((500, 240)))
+                    for _ in range(5):
+                        self.assertIsNone(tracker.detect(multiple))
+                        self.assertEqual(tracker.diagnostics['reason'], 'ambiguous')
+                        self.assertEqual(tracker.diagnostics['confirmation_frames'], 0)
+                for _ in range(2):self.assertIsNone(tracker.detect(frame((500, 240))))
+                self.assertIsNotNone(tracker.detect(frame((500, 240))))
+
+    def test_manual_selection_clears_pending_reacquisition(self):
+        tracker = DarkTargetTracker()
+        tracker.detect(frame())
+        tracker.detect(frame((500, 240)))
+        tracker.detect(frame((500, 240)))
+        tracker.reset((100, 240))
+        result = tracker.detect(frame((100, 240)))
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result['pixel'], (100, 240), atol=.1)
+        self.assertEqual(tracker.diagnostics['reason'], 'tracked')
+
+    def test_confirmation_frame_setting(self):
+        for invalid in (0, 1, 2.5, float('nan'), '3'):
+            with self.assertRaises(ValueError):DarkTargetTracker(reacquire_frames=invalid)
+        tracker = DarkTargetTracker(reacquire_frames=4)
+        tracker.detect(frame())
+        tracker.mark_lost()
+        for _ in range(3):self.assertIsNone(tracker.detect(frame()))
+        self.assertIsNotNone(tracker.detect(frame()))
 
 
 class RecorderTests(unittest.TestCase):
+    def test_session_directory_is_created_only_on_record_start(self):
+        with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
+            session = Path(directory)/'sessions'/'new_session'
+            recorder = BoundedRecorder(session, reserve_bytes=0)
+            recorder.write(frame(), 1, True, 'tracked', [100, 80])
+            recorder.tick()
+            recorder.stop()
+            self.assertFalse(session.exists())
+            with self.assertRaises(ValueError):recorder.start(0)
+            self.assertFalse(session.exists())
+            recorder.start(5)
+            recorder.write(frame(), 1, True, 'tracked', [100, 80])
+            recorder.stop()
+            self.assertTrue((recorder.directory/'unannotated.avi').is_file())
+
     def test_records_invalid_detections_and_real_timestamps(self):
         with tempfile.TemporaryDirectory(prefix='h_vision_test_') as directory:
             recorder = BoundedRecorder(directory)
@@ -197,7 +270,8 @@ class RecorderTests(unittest.TestCase):
 
 class WebTests(unittest.TestCase):
     def test_page_has_no_embedded_arm_control(self):
-        for fragment in ('arm-control', 'arm-panel', 'arm-waiting-button', 'ARM_PANEL_URL'):
+        for fragment in ('arm-control', 'arm-panel', 'arm-waiting-button', 'ARM_PANEL_URL',
+                         'mark-motor', '操作顺序', 'path-square', 'pathinfo'):
             self.assertNotIn(fragment, PAGE)
 
     def test_commands_are_validated_and_queued(self):
@@ -211,15 +285,13 @@ class WebTests(unittest.TestCase):
             return opener.open(req, timeout=2)
         try:
             post('/record/start', {'duration_s': 5}).close()
-            post('/event', {'label': 'motor_started'}).close()
-            post('/event', {'label': 'motor_stopped'}).close()
             post('/record/stop', {}).close()
-            self.assertEqual([c[0] for c in web.pop_commands()], ['record_start', 'event', 'event', 'record_stop'])
-            post('/path', {'kind': 'line_negative_y', 'size_mm': 10}, f'http://127.0.0.1:{port}').close()
-            self.assertEqual(list(web.pop_commands()), [('path', ('line_negative_y', 10))])
+            self.assertEqual([c[0] for c in web.pop_commands()], ['record_start', 'record_stop'])
+            for path in ('/event', '/path'):
+                with self.assertRaises(urllib.error.HTTPError) as result:post(path, {})
+                self.assertEqual(result.exception.code, 404)
             for path, body in [('/record/start', {'duration_s': 999}),
-                               ('/event', {'label': 'execute'}), ('/select', {'x': float('nan'), 'y': 0}),
-                               ('/path', {'kind': 'square', 'size_mm': float('nan')}), ('/reset', [])]:
+                               ('/select', {'x': float('nan'), 'y': 0}), ('/reset', [])]:
                 with self.assertRaises(urllib.error.HTTPError) as result:post(path, body)
                 self.assertEqual(result.exception.code, 400)
             with self.assertRaises(urllib.error.HTTPError) as result:post('/reset', {}, 'https://example.com')

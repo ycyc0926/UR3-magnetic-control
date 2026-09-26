@@ -10,7 +10,8 @@ from ur3_magnetic_control import ze300_motor
 from ur3_magnetic_control.ze300_motor import ZE300Motor, crc16, position_counts
 
 
-def test_protocol_over_pty():
+@pytest.mark.parametrize("rpm", [10, -10])
+def test_protocol_over_pty(rpm):
     assert crc16(bytes.fromhex("AE 00 01 0B 00")) == 0x289B
     assert position_counts(360) == 16384
     master, slave = os.openpty()
@@ -27,7 +28,7 @@ def test_protocol_over_pty():
 
     def device():
         try:
-            payload = struct.pack("<HiiiHHBBBB", 0, 16384, 1000, 0, 2426, 0, 30, 3, 1, 0)
+            payload = struct.pack("<HiiiHHBBBB", 0, 16384, rpm * 100, 0, 2426, 0, 30, 3, 1, 0)
             for expected in (0x0B, 0x21, 0x22, 0x23, 0x24, 0x1D, 0x2F):
                 header = read_exact(5)
                 frame = header + read_exact(header[4] + 2)
@@ -45,7 +46,7 @@ def test_protocol_over_pty():
     try:
         with ZE300Motor(port) as motor:
             assert motor.status()["position_deg"] == 360
-            assert motor.speed(10)["speed_rpm"] == 10
+            assert motor.speed(rpm)["speed_rpm"] == rpm
             motor.absolute(360)
             motor.relative(-90)
             motor.home()
@@ -57,7 +58,7 @@ def test_protocol_over_pty():
         os.close(slave)
     assert not worker.is_alive()
     assert not errors, errors
-    assert requests[1][5:13] == struct.pack("<iI", 1000, 0)
+    assert requests[1][5:13] == struct.pack("<iI", rpm * 100, 0)
     assert requests[2][5:9] == struct.pack("<i", 16384)
     assert requests[3][5:9] == struct.pack("<i", -4096)
     assert requests[4][4] == 0
@@ -74,7 +75,8 @@ def test_home_waits_for_position_and_speed():
     assert motor.wait_for_home(timeout=2)["speed_rpm"] == 0.1
 
 
-def test_saved_origin_uses_shortest_single_turn_move(tmp_path):
+@pytest.mark.parametrize("angle, expected", [(359, 1), (1, -1), (179, -179), (181, 179), (180, -180), (0, 0)])
+def test_saved_origin_uses_shortest_single_turn_move(tmp_path, angle, expected):
     class Motor:
         angle = 359
         commands = []
@@ -96,12 +98,40 @@ def test_saved_origin_uses_shortest_single_turn_move(tmp_path):
     path = tmp_path / "origin.json"
     ze300_motor.save_origin(motor, path)
     assert json.loads(path.read_text())["single_turn_counts"] == 0
-    motor.angle = 359
-    motor.position = 359
+    motor.angle = angle
+    motor.position = angle + 720  # Completed turns must not cause a long rewind.
     result = ze300_motor.restore_origin(motor, path)
-    assert 0 < motor.commands[0] < 2
-    assert abs(result["single_turn_deg"]) < 0.5
+    assert result["commanded_delta_deg"] == pytest.approx(expected, abs=.03)
+    assert len(motor.commands) == int(expected != 0)
+    assert abs((result["single_turn_deg"] + 180) % 360 - 180) < 0.5
     assert result["position_deg"] == 0
+
+
+def test_restore_origin_waits_for_stop_before_choosing_shortest_turn(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    path = tmp_path / "origin.json"
+    path.write_text(json.dumps({"schema": "ze300-magnet-origin/v1", "single_turn_counts": 0}))
+    motor = Mock()
+    motor.status.side_effect = [
+        {"single_turn_deg": 179, "position_deg": 179, "speed_rpm": 10},
+        {"single_turn_deg": 180, "position_deg": 180, "speed_rpm": 2},
+        {"single_turn_deg": 181, "position_deg": 181, "speed_rpm": 0},
+        {"single_turn_deg": 0, "position_deg": 360, "speed_rpm": 0},
+        {"single_turn_deg": 0, "position_deg": 0, "speed_rpm": 0},
+    ]
+    monkeypatch.setattr(ze300_motor.time, "sleep", lambda _: None)
+    result = ze300_motor.restore_origin(motor, path)
+    motor.speed.assert_called_once_with(0)
+    assert motor.relative.call_args.args[0] == pytest.approx(179, abs=.03)
+    assert result["position_deg"] == 0
+    motor.reset_mock()
+    motor.status.side_effect = None
+    motor.status.return_value = {"single_turn_deg": 179, "speed_rpm": 10}
+    with pytest.raises(TimeoutError, match="did not stop"):
+        ze300_motor.restore_origin(motor, path, timeout=0)
+    motor.relative.assert_not_called()
+    motor.set_origin.assert_not_called()
 
 
 def test_watch_restores_after_reconnection(tmp_path, monkeypatch):

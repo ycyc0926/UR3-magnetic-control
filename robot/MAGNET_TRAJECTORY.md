@@ -166,12 +166,13 @@ ros2 run ur3_magnetic_control magnet_trajectory point \
 - `magnet_path.png`：请求/规划/实测 XY 路径以及 X/Y/Z 随时间曲线；
 - `actual_magnet_path.jsonl`：同一任务的所有机械臂采样，含末端 `tool0` 位置与姿态、磁铁中心位置、电机角度、磁铁 N 极方向和磁铁姿态四元数；
 - `motor_samples.jsonl`：真实执行期间的电机编码器采样与电脑时间戳；
-- `h_robot/positions.csv`：按本次执行时间截取的 H 机器人相机观测；`h_robot/metadata.json` 记录源会话、帧数和检出帧数。未检测到 H 时没有有效 H 轨迹；
 - `execution.json`：执行成功和最终误差摘要；
 - `failure.json`：规划或执行失败原因。
 
-相机原始连续会话仍保存在 `/home/yc/UR3/camera/tracking_sessions/`；实验目录中的 H 数据是按时间截取的副本。
-两路数据使用电脑与相机消息时间戳对齐，没有硬件触发同步。
+相机数据仅在跟踪页面点击录像后保存。主程序正在执行并记录实验时，保存于该实验目录的
+`h_robot/clip_录像时间/`；其他时候保存于 `/home/yc/UR3/experiments/camera_only/录像时间/h_robot/clip_录像时间/`。
+每段录像在点击开始时绑定目录，录制中途不会切换实验；主程序退出后不会继续绑定旧实验。
+相机和机械臂数据可使用各自的电脑时间戳对齐，没有硬件触发同步。
 `config/ur3_system.yaml` 的 `calibration.motor_phase_sign` 已按 +90° 实测结果设为 `-1`：
 编码器正转时磁铁 N 极从 tool0 +X 转向 -Y。
 `motor_encoder_turns_per_magnet_turn` 已按当前直连结构设为 `1.0`。

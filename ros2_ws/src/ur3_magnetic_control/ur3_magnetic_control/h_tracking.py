@@ -49,31 +49,20 @@ class PlaneMapper:
         return (raw.reshape(-1, 2)+.5)/scale-.5
 
 
-def reference_path(kind, start_xy, size_mm=20.0):
-    """Visual reference only; no IK, reachability, or robot command semantics."""
-    start = np.asarray(start_xy, dtype=float)
-    if start.shape != (2,) or not np.isfinite(start).all():
-        raise ValueError('Invalid path origin')
-    if not np.isfinite(size_mm) or not 5 <= size_mm <= 40:
-        raise ValueError('Visual reference size must be 5--40 mm')
-    offsets = {'line': [[0, 0], [0, 1]],
-               'line_negative_y': [[0, 0], [0, -1]],
-               'square': [[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]}
-    if kind not in offsets:
-        raise ValueError('Unknown reference shape')
-    return start + np.asarray(offsets[kind])*size_mm/1000
-
-
 class DarkTargetTracker:
     """Track the selected dark silhouette, not a semantic H classifier.
 
-    Initial selection is near image centre. Position and area gates maintain
-    identity; after sustained loss, an explicit reset is needed to reacquire.
+    Initial selection is near image centre. After loss, search the full image
+    and confirm a unique, continuous candidate before publishing again.
     """
-    def __init__(self, threshold=80, minimum_area=150, maximum_area=8000):
+    def __init__(self, threshold=80, minimum_area=150, maximum_area=8000,
+                 reacquire_frames=3):
+        if not isinstance(reacquire_frames, int) or reacquire_frames < 2:
+            raise ValueError('Reacquisition requires at least two confirmation frames')
         self.threshold = threshold
         self.minimum_area = minimum_area
         self.maximum_area = maximum_area
+        self.reacquire_frames = reacquire_frames
         self.reset()
 
     def reset(self, seed=None):
@@ -81,32 +70,37 @@ class DarkTargetTracker:
         self.last = None
         self.area = None
         self.misses = 0
-        self.locked_out = False
-        self.initialized = False
+        self.mark_lost()
         self.diagnostics = {'reason': 'not_selected'}
+
+    def mark_lost(self):
+        """Break confirmation on missing/ambiguous frames or a stream timeout."""
+        self.reacquiring = self.last is not None
+        self.pending_center = None
+        self.confirmations = 0
 
     def detect(self, image):
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         mask = cv2.inRange(gray, 0, self.threshold)
-        margin_x, margin_y = int(width*.07), int(height*.07)
-        mask[:margin_y] = 0; mask[height-margin_y:] = 0
-        mask[:, :margin_x] = 0; mask[:, width-margin_x:] = 0
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
         rejected = {'area': 0, 'shape_or_border': 0, 'area_change': 0,
                     'moment': 0, 'distance': 0}
         reference = self.last if self.last is not None else (
             self.seed if self.seed is not None else np.array([width/2, height/2]))
-        radius = 35 if self.last is not None else min(width, height)*.15
+        tracking_radius = 35
+        radius = float(np.hypot(width, height)) if self.reacquiring else (
+            tracking_radius if self.last is not None else min(width, height)*.15)
         for contour in contours:
             area = cv2.contourArea(contour)
             if not self.minimum_area <= area <= self.maximum_area:
                 rejected['area'] += 1
                 continue
             x, y, w, h = cv2.boundingRect(contour)
-            if not .2 <= w/h <= 5 or x <= margin_x or y <= margin_y or x+w >= width-margin_x or y+h >= height-margin_y:
+            # Border contact can mean a clipped silhouette and a biased centre.
+            if not .2 <= w/h <= 5 or x == 0 or y == 0 or x+w == width or y+h == height:
                 rejected['shape_or_border'] += 1
                 continue
             if self.area is not None and not .3 <= area/self.area <= 3:
@@ -124,27 +118,36 @@ class DarkTargetTracker:
                 rejected['distance'] += 1
         self.diagnostics = {'contours': len(contours), 'candidates': len(candidates),
                             'rejected': rejected, 'radius_px': radius,
-                            'threshold': self.threshold}
-        if self.locked_out or not candidates:
-            self.misses += 1
-            if self.initialized and self.misses >= 5:
-                self.locked_out = True
-            self.diagnostics.update(reason='locked_out' if self.locked_out else 'no_candidate',
-                                    misses=self.misses)
-            return None
+                            'threshold': self.threshold, 'confirmation_frames': 0,
+                            'reacquire_frames': self.reacquire_frames}
         candidates.sort(key=lambda c: c[0])
-        if len(candidates) > 1 and candidates[1][0]-candidates[0][0] < 15:
+        ambiguous = len(candidates) > 1 and (
+            self.reacquiring or candidates[1][0]-candidates[0][0] < 15)
+        if not candidates or ambiguous:
             self.misses += 1
-            if self.misses >= 5:
-                self.locked_out = True
-            self.diagnostics.update(reason='locked_out' if self.locked_out else 'ambiguous',
+            self.mark_lost()
+            self.diagnostics.update(reason='ambiguous' if ambiguous else 'no_candidate',
                                     misses=self.misses)
             return None
         distance, center, area, contour, box = candidates[0]
+        reacquired = self.reacquiring
+        if reacquired:
+            # ponytail: area/continuity cannot prove H identity; add shape matching if needed.
+            if self.pending_center is None or np.linalg.norm(center-self.pending_center) > tracking_radius:
+                self.confirmations = 0
+            self.pending_center = center
+            self.confirmations += 1
+            self.diagnostics['confirmation_frames'] = self.confirmations
+            if self.confirmations < self.reacquire_frames:
+                self.misses += 1
+                self.diagnostics.update(reason='reacquiring', misses=self.misses)
+                return None
         self.last = center
         self.area = area if self.area is None else .95*self.area + .05*area
         self.misses = 0
-        self.initialized = True
-        self.diagnostics.update(reason='tracked', misses=0)
+        self.reacquiring = False
+        self.pending_center = None
+        self.confirmations = 0
+        self.diagnostics.update(reason='reacquired' if reacquired else 'tracked', misses=0)
         return {'pixel': center, 'area_px': area, 'contour': contour, 'box': box,
                 'confidence': max(.1, 1-distance/radius)}

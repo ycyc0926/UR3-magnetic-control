@@ -2,12 +2,13 @@
 
 import json
 import math
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from ament_index_python.packages import get_package_share_directory
@@ -62,6 +63,17 @@ ROOT = Path(__file__).resolve().parents[4]
 
 
 class TargetGenerationTests(unittest.TestCase):
+    def test_recording_switches_and_reverse_speed(self):
+        for flags, no_record, no_camera in [([], False, False), (["--no"], True, True),
+                                          (["--no", "camera"], False, True),
+                                          (["--no-record"], True, True)]:
+            parsed = parse_arguments(["point", "--target-z-mm", "400", *flags,
+                                      "--motor-rpm", "-10"])
+            self.assertEqual((parsed.no_record, parsed.no_camera), (no_record, no_camera))
+            self.assertEqual(parsed.motor_rpm, -10)
+        with self.assertRaises(SystemExit):
+            parse_arguments(["point", "--target-z-mm", "400", "--no", "--output", "/tmp/run"])
+
     def test_point_uses_absolute_table_world_millimetres(self):
         points, metadata = build_point_targets([125.0, 30.0, 450.0])
         np.testing.assert_allclose(points, [[0.125, 0.030, 0.450]])
@@ -298,8 +310,12 @@ class WaypointAndRouteTests(unittest.TestCase):
         self.assertEqual(len(route), 3)
         np.testing.assert_allclose(segments, [0.01, 0.02])
         self.assertAlmostEqual(total, 0.03)
-        with self.assertRaisesRegex(ValueError, "300 mm"):
-            validate_route([0, 0, 0.1], [[0.301, 0, 0.1]])
+        for distance in (0.350, 0.400):
+            _, segments, total = validate_route([0, 0, 0.1], [[distance, 0, 0.1]])
+            self.assertEqual(segments, [distance])
+            self.assertEqual(total, distance)
+        with self.assertRaisesRegex(ValueError, "400 mm"):
+            validate_route([0, 0, 0.1], [[0.401, 0, 0.1]])
 
     def test_point_to_polyline_distance(self):
         distance = point_polyline_distance(
@@ -426,6 +442,171 @@ class SavedTraceTests(unittest.TestCase):
 
 
 class ExecutionGateTests(unittest.TestCase):
+    def test_recording_modes_in_planning_execution_and_failure(self):
+        from ur3_magnetic_control import magnet_trajectory as module
+        from ur3_magnetic_control.experiment_data import active_experiment, current_experiment
+
+        for flags in ([], ["--no"], ["--no-record"], ["--no", "camera"]):
+            for outcome in ("plan", "execute", "failure", "home_failure", "stop_failure"):
+                with self.subTest(flags=flags, outcome=outcome), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                    output = Path(directory) / "run"
+                    no_record = flags in (["--no"], ["--no-record"])
+                    context_file = Path(directory) / "active"
+                    context = stack.enter_context(patch.object(
+                        module, "active_experiment",
+                        side_effect=lambda path: active_experiment(path, context_file)))
+                    measured = {"magnet_world_mm": [146., 146., 400.],
+                                "motor_axis_world": [0., 0., 1.],
+                                "tool_normal_world": [0., 0., 1.],
+                                "tool_quaternion_world_xyzw": [0., 0., 0., 1.]}
+                    node = Mock()
+                    node.latest_joint_state = JointState(name=list(JOINT_NAMES),
+                                                        position=[0.] * 6, velocity=[0.] * 6)
+                    node.joint_state_received_at = time.monotonic()
+                    node.geometry.inspect.return_value = measured
+                    # A stopped External Control program may not have published
+                    # its first running-state message yet. Planning must still work.
+                    node.robot_program_running = None
+                    node.speed_scaling_percent = 0.
+                    node.wait_for_fresh_state.side_effect = lambda timeout=5., require_execution_state=False: MagnetTrajectoryNode.wait_for_fresh_state(
+                        node, timeout=.02, require_execution_state=require_execution_state)
+                    node.tool_orientation_reference_world = None
+                    node.table_parallel_start_world = None
+                    node.target_motor_axis_world = node.target_tool_z_world = None
+                    node.actual_stream = None
+                    node.execution_goal_sent = outcome != "plan"
+                    node.dashboard_stop_message = None
+                    node.ceiling_guard.tool_data = {"execution_allowed": True}
+                    node.verify_start.return_value = 0.
+                    node.plan_magnet_targets.return_value = {
+                        "solution": RobotTrajectory(), "start_state": RobotState(),
+                        "planned_trace": [{"time_s": 0., **measured}],
+                        "targets_world_m": [[.146, .146, .4]],
+                        "start_magnet_world_m": [.146, .146, .4],
+                        "fraction": 1., "total_length_m": 0., "duration_s": 1.,
+                        "motor_axis_alignment": None,
+                    }
+                    node.start_actual_recording.side_effect = lambda path: MagnetTrajectoryNode.start_actual_recording(node, path)
+                    node.stop_actual_recording.side_effect = lambda: MagnetTrajectoryNode.stop_actual_recording(node)
+                    node.monitor_execution_state.side_effect = lambda state: MagnetTrajectoryNode.monitor_execution_state(node, state)
+                    if outcome == "failure":
+                        node.execute.side_effect = RuntimeError("simulated execution failure")
+                    def create_node():
+                        self.assertEqual(current_experiment(context_file),
+                                         output if outcome != "plan" and not no_record else None)
+                        return node
+                    stack.enter_context(patch.object(module, "MagnetTrajectoryNode", side_effect=create_node))
+                    startup = stack.enter_context(patch.object(module, "prepare_motion_stack"))
+                    external = stack.enter_context(patch.object(module, "ensure_external_control"))
+                    def connect_external(_node):
+                        _node.robot_program_running = True
+                        _node.speed_scaling_percent = 100.
+                    external.side_effect = connect_external
+                    order = Mock()
+                    order.attach_mock(startup, "prepare")
+                    order.attach_mock(node.plan_magnet_targets, "plan")
+                    order.attach_mock(external, "play")
+                    order.attach_mock(node.execute, "execute")
+                    ros = stack.enter_context(patch.object(module, "rclpy"))
+                    ros.spin_once.side_effect = lambda *a, **k: setattr(node, "joint_state_received_at", time.monotonic())
+                    motor = stack.enter_context(patch.object(module, "ZE300Motor")).return_value
+                    order.attach_mock(motor.speed, "motor")
+                    motor.status.return_value = motor.speed.return_value = {"position_counts": 0, "speed_rpm": -10}
+                    homed_status = {"commanded_delta_deg": 1., "position_counts": 0,
+                                    "position_deg": 0., "single_turn_deg": 0.,
+                                    "speed_rpm": 0., "enabled": True, "fault_code": 0}
+                    def return_motor_to_origin(_motor):
+                        self.assertEqual(_motor.speed.call_args.args, (0,))
+                        if outcome == "home_failure":
+                            raise TimeoutError("simulated homing timeout")
+                        _motor.status.return_value = homed_status
+                        return homed_status
+                    home = stack.enter_context(patch.object(module, "restore_origin", side_effect=return_motor_to_origin))
+                    order.attach_mock(home, "home")
+                    if outcome == "stop_failure":
+                        def fail_stop(rpm):
+                            if rpm == 0:
+                                raise OSError("simulated motor stop failure")
+                            return motor.speed.return_value
+                        motor.speed.side_effect = fail_stop
+                    recorder = stack.enter_context(patch.object(module, "MotorRecorder", wraps=module.MotorRecorder))
+                    writer = stack.enter_context(patch.object(module, "write_json_exclusive", wraps=module.write_json_exclusive))
+                    plot = stack.enter_context(patch.object(module, "plot_trajectory"))
+                    destination = stack.enter_context(patch.object(module, "default_output_directory", return_value=output))
+                    arguments = ["point", "--target-mm", "146", "146", "400", "--motor-rpm", "-10", *flags]
+                    if outcome != "plan":
+                        arguments.append("--execute")
+                    if outcome in ("failure", "home_failure", "stop_failure"):
+                        with self.assertRaises(SystemExit):
+                            main(arguments)
+                        motor.speed.assert_any_call(0)
+                        self.assertEqual(str(node.get_logger.return_value.error.call_args.args[0]),
+                                         {"failure": "simulated execution failure",
+                                          "home_failure": "simulated homing timeout",
+                                          "stop_failure": "simulated motor stop failure"}[outcome])
+                    else:
+                        main(arguments)
+                    self.assertEqual(context.call_count, int(outcome != "plan" and not no_record))
+                    self.assertIsNone(current_experiment(context_file))
+                    self.assertFalse((output / "h_robot").exists())
+                    startup.assert_called_once_with(node, ROOT, no_record=no_record)
+                    if outcome != "plan":
+                        external.assert_called_once_with(node)
+                        self.assertEqual([item[0] for item in order.mock_calls[:4]],
+                                         ["prepare", "plan", "play", "motor"])
+                        motor.speed.assert_any_call(-10.)
+                        node.execute.assert_called_once()
+                        node.start_actual_recording.assert_called_once_with(None if no_record else output / "actual_magnet_path.jsonl")
+                    else:
+                        external.assert_not_called()
+                        motor.speed.assert_not_called()
+                    if outcome in ("execute", "home_failure"):
+                        home.assert_called_once_with(motor)
+                        self.assertEqual([item[0] for item in order.mock_calls[:7]],
+                                         ["prepare", "plan", "play", "motor", "execute", "motor", "home"])
+                    else:
+                        home.assert_not_called()
+                    if no_record:
+                        self.assertEqual(list(Path(directory).iterdir()), [])
+                        destination.assert_not_called()
+                        writer.assert_not_called()
+                        plot.assert_not_called()
+                        recorder.assert_not_called()
+                        ros.init.assert_called_once_with(args=["--ros-args", "--disable-external-lib-logs"])
+                        if outcome == "execute":
+                            self.assertEqual(node.actual_samples.maxlen, 1)
+                    else:
+                        self.assertTrue((output / "plan.json").is_file())
+                        if outcome != "plan":
+                            self.assertTrue((output / "motor_samples.jsonl").is_file())
+                            self.assertTrue((output / ("execution.json" if outcome == "execute" else "failure.json")).is_file())
+                        if outcome == "execute":
+                            execution = json.loads((output / "execution.json").read_text())
+                            self.assertEqual(execution["motor_return_to_origin"], homed_status)
+                    self.assertFalse((output / "h_robot").exists())
+
+    def test_startup_or_planning_failure_never_starts_motion(self):
+        from ur3_magnetic_control import magnet_trajectory as module
+
+        for stage in ("startup", "planning"):
+            with self.subTest(stage=stage), ExitStack() as stack:
+                node = Mock()
+                node.latest_joint_state = JointState(position=[0.] * 6, velocity=[0.] * 6)
+                node.plan_magnet_targets.side_effect = RuntimeError("planning failed")
+                stack.enter_context(patch.object(module, "MagnetTrajectoryNode", return_value=node))
+                stack.enter_context(patch.object(module, "rclpy"))
+                startup = stack.enter_context(patch.object(module, "prepare_motion_stack"))
+                external = stack.enter_context(patch.object(module, "ensure_external_control"))
+                motor = stack.enter_context(patch.object(module, "ZE300Motor"))
+                if stage == "startup":
+                    startup.side_effect = RuntimeError("startup failed")
+                with self.assertRaises(SystemExit):
+                    main(["point", "--target-mm", "146", "146", "400",
+                          "--motor-rpm", "10", "--no", "--execute"])
+                motor.assert_not_called()
+                node.execute.assert_not_called()
+                external.assert_not_called()
+
     def test_live_monitor_records_motion_and_propagates_boundary_failure(self):
         checked = {"magnet_world_mm": [100.0, 20.0, 300.0]}
         geometry = SimpleNamespace(inspect=lambda names, positions: checked)

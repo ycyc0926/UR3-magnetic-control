@@ -87,11 +87,6 @@ class BrowserTests(unittest.TestCase):
         expected = [
             ('reset-target', ('reset', None)), ('clear-trail', ('clear', None)),
             ('start-recording', ('record_start', 120)), ('stop-recording', ('record_stop', None)),
-            ('mark-motor-started', ('event', 'motor_started')),
-            ('mark-motor-stopped', ('event', 'motor_stopped')),
-            ('path-negative-y', ('path', ('line_negative_y', 10))),
-            ('path-positive-y', ('path', ('line', 10))),
-            ('path-square', ('path', ('square', 24))), ('hide-path', ('path', ('clear', 20))),
         ]
         for element_id, command in expected:
             self.browser.click(element_id)
@@ -107,8 +102,8 @@ class BrowserTests(unittest.TestCase):
         self.assertTrue(0 <= received[0][1][0] < 1224)
         self.assertTrue(0 <= received[0][1][1] < 1024)
         until(lambda: self.browser.script("return document.getElementById('feedback').textContent.startsWith('已提交')"))
-        self.web.status = json.dumps({'command_error': '请先锁定静止的 H，再设置参考路径'}).encode()
-        until(lambda: self.browser.script("return document.getElementById('commanderror').textContent.includes('请先锁定')"))
+        self.web.status = json.dumps({'command_error': '相机无新图像，未开始录像'}).encode()
+        until(lambda: self.browser.script("return document.getElementById('commanderror').textContent.includes('相机无新图像')"))
         self.assertIn('已提交', self.browser.script("return document.getElementById('feedback').textContent"))
         self.assertEqual(self.browser.script('return window.testErrors'), [])
 
@@ -119,6 +114,22 @@ class BrowserTests(unittest.TestCase):
         time.sleep(1.1)
         self.assertIn('429', self.browser.script("return document.getElementById('feedback').textContent"))
         self.assertFalse(self.browser.script("return document.getElementById('clear-trail').disabled"))
+
+    def test_reacquisition_progress_and_ambiguity_keep_coordinates_hidden(self):
+        for reason, expected in [('reacquiring', '1/3'), ('ambiguous', '等待唯一目标')]:
+            self.web.status = json.dumps({
+                'detected': False, 'tracking_reason': reason,
+                'tracking_diagnostics': {'confirmation_frames': 1, 'reacquire_frames': 3},
+            }).encode()
+            until(lambda: expected in self.browser.script("return document.getElementById('diagnostic').textContent"))
+            self.assertEqual(self.browser.script("return document.getElementById('xy').textContent"), '—')
+        self.web.status = json.dumps({
+            'detected': True, 'tracking_reason': 'reacquired',
+            'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'world_xy_mm': [123, 45], 'displacement_from_reset_mm': [23, 5],
+        }).encode()
+        until(lambda: self.browser.script("return document.getElementById('xy').textContent") == '123.00 , 45.00')
+        self.assertEqual(self.browser.script('return window.testErrors'), [])
 
 
 if __name__ == '__main__':

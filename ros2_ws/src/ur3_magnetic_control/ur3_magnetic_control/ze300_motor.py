@@ -84,9 +84,15 @@ def restore_origin(motor, path=DEFAULT_ORIGIN_FILE, timeout=60.0):
     if (origin.get("schema") != "ze300-magnet-origin/v1"
             or type(target) is not int or not 0 <= target < COUNTS_PER_TURN):
         raise ValueError("invalid saved ZE300 magnet origin")
+    deadline = time.monotonic() + timeout
     current = motor.status()
     if abs(current["speed_rpm"]) > 0.5:
         motor.speed(0)
+    # Measure the shortest turn from the stopped position, not while coasting.
+    while abs(current["speed_rpm"]) > 0.5:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("ZE300 did not stop before returning to the saved origin")
+        time.sleep(0.1)
         current = motor.status()
     delta = (target - single_turn_counts(current["single_turn_deg"])
              + COUNTS_PER_TURN // 2) % COUNTS_PER_TURN - COUNTS_PER_TURN // 2
@@ -94,7 +100,6 @@ def restore_origin(motor, path=DEFAULT_ORIGIN_FILE, timeout=60.0):
         delta = 0
     else:
         motor.relative(delta * 360 / COUNTS_PER_TURN)
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = motor.status()
         error = (target - single_turn_counts(status["single_turn_deg"])

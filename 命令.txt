@@ -5,25 +5,22 @@ bash /home/yc/UR3/camera/start_h_tracking.sh
 保持该终端运行，再执行打开网页的命令。
 
 机械臂：
-终端 1：启动驱动和 MoveIt，保持运行
-source /home/yc/UR3/ros2_env.sh && ros2 launch /home/yc/UR3/robot/motion_stack.launch.py
+指定磁铁中心目标点（table_world 桌面世界坐标，单位 mm）
+首次命令先去掉 --execute 检查规划，通过后再执行：
 
-示教器播放 External Control 后，
+source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-mm 320 160 400 --motor-rpm 10 --no --execute
 
-终端 2：发送移动
-source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-xy-mm 88 148 --execute
-
-新工具末端 Z 轴垂直桌面时的正方形（先只规划）：
-source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 138 198 --size-mm 100 --motor-axis-parallel z --axis-alignment-phase before
-
-新工具末端 Z 轴平行桌面时的正方形（先只规划）：
-source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory square --center-xy-mm 113 173 --size-mm 50 --tool-z-parallel-table --tool-z-heading-deg 60 --planning-chunk-mm 50
-
-这两个中心坐标仅在磁铁当前位于 (88, 148) mm 时对应左下角起点；旧工具的可达性结果不适用于新工具。
+--no：不保存本条命令的任何数据文件，包括临时记录和 ROS 文件日志。
+--no camera：不启动相机、不保存相机数据；其他数据正常记录，独立相机服务不受影响。
+--motor-rpm -10：电机以 10 rpm 反转。
+只改 XY、保持当前磁铁高度：把 --target-mm 146 146 400 换成 --target-xy-mm 146 146。
 
 
-驱动机械臂：
-source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control magnet_trajectory point --target-mm 146 146 400 --motor-rpm 10 --execute
+桌面程序：
+bash /home/yc/UR3/robot/start_ze300_gui.sh
+bash /home/yc/UR3/camera/start_flir_camera.sh
+FLIR 跟踪已运行时会打开现有跟踪页面；未运行时打开全分辨率查看器。
+
 
 电机停止转动：
 source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor speed 0
@@ -32,5 +29,5 @@ source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor hom
 
 断电重连自动恢复磁铁原点（服务状态）：
 systemctl --user status ur3-motor-origin.service
-手动恢复已保存的磁铁原点：
+手动恢复已保存的磁铁水平原点：
 source /home/yc/UR3/ros2_env.sh && ros2 run ur3_magnetic_control ze300_motor restore-origin

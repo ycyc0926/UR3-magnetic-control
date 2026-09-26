@@ -1,8 +1,10 @@
-"""Keep the camera observations for one arm experiment beside its trajectory."""
+"""Share the active experiment directory and record its motor samples."""
 
-import csv
+from contextlib import contextmanager
+import fcntl
 import json
 import math
+import os
 from pathlib import Path
 from threading import Event, Thread
 import time
@@ -12,7 +14,43 @@ from scipy.spatial.transform import Rotation
 from .ze300_motor import COUNTS_PER_TURN
 
 
-DEFAULT_H_SESSIONS = Path("/home/yc/UR3/camera/tracking_sessions")
+ACTIVE_EXPERIMENT_FILE = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'ur3-active-experiment'
+
+
+@contextmanager
+def active_experiment(directory, context_file=ACTIVE_EXPERIMENT_FILE):
+    """A held OS lock distinguishes a live experiment from an abandoned path."""
+    directory = Path(directory).resolve(strict=True)
+    with Path(context_file).open('a+') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('Another recorded experiment is already running') from error
+        stream.seek(0)
+        stream.truncate()
+        stream.write(str(directory))
+        stream.flush()
+        try:
+            yield directory
+        finally:
+            stream.seek(0)
+            stream.truncate()
+            stream.flush()
+
+
+def current_experiment(context_file=ACTIVE_EXPERIMENT_FILE):
+    try:
+        with Path(context_file).open() as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                directory = Path(stream.read())
+                if not directory.is_absolute() or not directory.is_dir():
+                    raise RuntimeError('实验目录正在切换，请重新点击录像')
+                return directory
+    except FileNotFoundError:
+        pass
+    return None
 
 
 class MotorRecorder:
@@ -114,47 +152,3 @@ def add_magnet_pose(path, motor_samples, phase_sign, encoder_turns_per_magnet_tu
     finally:
         result_path.unlink(missing_ok=True)
     return count
-
-
-def copy_h_positions(output, start_ns, end_ns, sessions=DEFAULT_H_SESSIONS,
-                     source_session=None):
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=False)
-    if source_session is None:
-        statuses = list(Path(sessions).glob("*/status.json"))
-        status = max(statuses, key=lambda path: path.stat().st_mtime_ns) if statuses else None
-        source_session = status.parent if status and status.stat().st_mtime_ns >= end_ns - 5_000_000_000 else None
-    source = Path(source_session) / "positions.csv" if source_session else None
-    summary = {
-        "source_session": str(source_session) if source_session else None,
-        "start_host_time_ns": start_ns,
-        "end_host_time_ns": end_ns,
-        "rows": 0,
-        "detected_rows": 0,
-        "time_alignment": "camera frame timestamp versus robot host clock; no hardware trigger",
-    }
-    if source is not None and source.is_file():
-        with source.open(newline="", encoding="utf-8") as incoming, (output / "positions.csv").open(
-            "x", newline="", encoding="utf-8"
-        ) as outgoing:
-            reader = csv.reader(incoming)
-            writer = csv.writer(outgoing)
-            header = next(reader)
-            if not header or header[0] != "host_frame_time_ns":
-                raise ValueError(f"invalid H trajectory header: {source}")
-            writer.writerow(header)
-            for row in reader:
-                if len(row) != len(header):
-                    continue
-                try:
-                    stamp = int(row[0])
-                except ValueError:
-                    continue
-                if start_ns <= stamp <= end_ns:
-                    writer.writerow(row)
-                    summary["rows"] += 1
-                    summary["detected_rows"] += row[1] == "1"
-    (output / "metadata.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    return summary

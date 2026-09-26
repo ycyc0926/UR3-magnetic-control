@@ -23,13 +23,13 @@ button{padding:11px 15px;background:#276b8b;border:0;color:white;border-radius:6
 button:disabled{opacity:.5;cursor:wait}#feedback{padding:10px;border:1px solid #537080;border-radius:6px;overflow-wrap:anywhere}
 .note{font-size:14px;color:#b0bdc9;line-height:1.7}.ok{color:#86dfb8}.bad{color:#ffad8f}
 @media(max-width:900px){main{grid-template-columns:1fr}aside{order:-1}}
-</style><header><h1>H 机器人 · 实时定位</h1><span class="tag">视觉区只记录 · 电机须手动启停</span></header>
+</style><header><h1>H 机器人 · 实时定位</h1><span class="tag">定位 · 轨迹 · 录像</span></header>
 <main><div><img id="view" src="/stream" alt="等待相机图像"><p class="note">绿框：选中的目标　红十字：轮廓中心　黄色线：近期轨迹。点击图中的 H 可重新选择。</p>
 <section id="trajectory-wrap"><h2>最近保留录像的中心轨迹</h2><img id="trajectory" alt="H 中心运动轨迹"></section></div>
 <aside><div id="state" class="value">连接中…</div><div class="label">世界坐标 / mm</div><div id="xy" class="value">—</div>
 <div class="label">相对起点位移 / mm</div><div id="delta" class="value">—</div>
 <div id="rate" class="note"></div><p id="spread" class="note"></p>
-<p id="feedback" class="note" role="status" aria-live="polite">等待操作；本区按钮只操作视觉记录。</p>
+<p id="feedback" class="note" role="status" aria-live="polite">点击画面中的 H 选择目标。</p>
 <p id="commanderror" class="note bad" role="alert"></p>
 <button id="reset-target" data-endpoint="/reset">重新锁定画面中心目标</button><button id="clear-trail" data-endpoint="/clear">清空轨迹并重设起点</button>
 <p class="note">坐标使用现有相机标定，仍需用实物已知距离核验。静止抖动小不等于绝对定位准确；翻滚时轮廓中心会变化。</p>
@@ -37,23 +37,15 @@ button:disabled{opacity:.5;cursor:wait}#feedback{padding:10px;border:1px solid #
 <button id="start-recording" data-endpoint="/record/start" data-body='{"duration_s":120}'>开始连续录像（最多 120 秒）</button>
 <button id="stop-recording" data-endpoint="/record/stop">结束录像并自动筛选</button>
 <p id="motion" class="note">录像结束后将按中心位移筛选：有运动则保留并绘制轨迹，静止则删除该段录像。</p>
-<p class="note bad">上述按钮只控制录像，绝不启停电机！录像倒计时结束也不会停止电机。目标丢失时须人工停止电机。</p>
-<button id="mark-motor-started" data-endpoint="/event" data-body='{"label":"motor_started"}'>标记：电机已启动（仅记时间）</button>
-<button id="mark-motor-stopped" data-endpoint="/event" data-body='{"label":"motor_stopped"}'>标记：电机已停止（仅记时间）</button>
-<hr><button id="path-negative-y" data-endpoint="/path" data-body='{"kind":"line_negative_y","size_mm":10}'>显示 −Y 10 mm 参考线</button>
-<button id="path-positive-y" data-endpoint="/path" data-body='{"kind":"line","size_mm":10}'>显示 +Y 10 mm 参考线</button>
-<button id="path-square" data-endpoint="/path" data-body='{"kind":"square","size_mm":24}'>显示 24 mm 方形参考</button>
-<button id="hide-path" data-endpoint="/path" data-body='{"kind":"clear"}'>隐藏参考路径</button>
-<p id="pathinfo" class="note"></p><p id="diagnostic" class="note"></p>
-<p class="note">参考路径以当前 H 为起点，仅用于观察；不代表机械臂已规划、可达或安全。点击重新选择后应重新设置参考路径。</p>
-<p class="note">操作顺序：电机停止 → 放置 H 并锁定 → 开始录像 → 确认录像帧数增长 → 现场低速短时启停 → 电机停止后保存录像。</p></aside></main>
+<p class="note">本页面不控制电机；录像结束或目标丢失不会停机。</p>
+<p id="diagnostic" class="note"></p></aside></main>
 <script>
 (() => {
 'use strict';
 // No inline handlers or implicit DOM globals: button.command is a native string property.
 const elements = {};
-for (const id of ['view','state','xy','delta','rate','spread','record','motion','trajectory','trajectory-wrap','diagnostic','pathinfo','commanderror','feedback']) elements[id] = document.getElementById(id);
-const {view,state,xy,delta,rate,spread,record,motion,trajectory,diagnostic,pathinfo,commanderror,feedback} = elements;
+for (const id of ['view','state','xy','delta','rate','spread','record','motion','trajectory','trajectory-wrap','diagnostic','commanderror','feedback']) elements[id] = document.getElementById(id);
+const {view,state,xy,delta,rate,spread,record,motion,trajectory,diagnostic,commanderror,feedback} = elements;
 const trajectoryWrap=elements['trajectory-wrap'];
 async function sendVisionRequest(url, body, label, button=null) {
   if (button) button.disabled = true;
@@ -81,7 +73,6 @@ view.addEventListener('click', e => {
   const r = view.getBoundingClientRect();
   sendVisionRequest('/select', {x:(e.clientX-r.left)/r.width*1224,y:(e.clientY-r.top)/r.height*1024}, '选择图中目标');
 });
-const pathNames = {line:'+Y 直线',line_negative_y:'−Y 直线',square:'方形'};
 let updating = false;
 async function update(){if(updating)return;updating=true;const controller=new AbortController();const deadline=setTimeout(()=>controller.abort(),2000);try{let r=await fetch('/status',{cache:'no-store',signal:controller.signal});if(!r.ok)throw Error('状态请求失败');let s=await r.json();let valid=s.detected&&!s.stream_stale&&Date.now()-Date.parse(s.utc)<1500;
 state.textContent=valid?'● 已锁定 H': '● 目标丢失 / 图像超时';state.className='value '+(valid?'ok':'bad');
@@ -97,9 +88,10 @@ else{record.textContent=rec.error?'录像错误：'+rec.error:'录像未启动';
 if(rec.trajectory_available){trajectoryWrap.style.display='block';let serial=String(rec.finalization_serial||0);if(trajectory.dataset.serial!==serial){trajectory.dataset.serial=serial;trajectory.src='/trajectory?v='+encodeURIComponent(serial);}}
 else{trajectoryWrap.style.display='none';trajectory.removeAttribute('src');trajectory.dataset.serial='';}
 diagnostic.textContent='检测诊断：'+(s.tracking_reason||'等待图像');
-const rejected=(s.tracking_diagnostics||{}).rejected||{};
-if (!valid && rejected.shape_or_border) diagnostic.textContent+='；目标可能靠近边缘或轮廓不符合条件，请勿继续驱动。';
-pathinfo.textContent=s.reference_path?'当前参考：'+(pathNames[s.reference_path.kind]||s.reference_path.kind)+'，'+s.reference_path.size_mm+' mm（仅显示）':'尚未设置参考路径';
+const tracking=s.tracking_diagnostics||{},rejected=tracking.rejected||{};
+if(s.tracking_reason==='reacquiring') diagnostic.textContent='自动重捕获：唯一候选已连续确认 '+tracking.confirmation_frames+'/'+tracking.reacquire_frames+' 帧';
+if(s.tracking_reason==='ambiguous') diagnostic.textContent='多个候选目标，等待唯一目标；也可点击 H 重新选择。';
+if (!valid && rejected.shape_or_border) diagnostic.textContent+='；目标可能触碰画面边界或轮廓不符合条件，请勿继续驱动。';
 commanderror.textContent=s.command_error?'后台未执行：'+s.command_error:'';
 }catch(e){state.textContent='● 未连接';state.className='value bad';xy.textContent='—';delta.textContent='—';record.textContent='录像状态未知（连接中断）；本页面不能停止电机';record.className='value bad'}finally{clearTimeout(deadline);updating=false}}setInterval(update,500);update();
 })();
@@ -155,7 +147,7 @@ class LocalPreview:
                 if self.headers.get('Origin', origin) != origin:
                     self.send_error(403);return
                 if self.path not in ('/reset', '/clear', '/select', '/record/start',
-                                     '/record/stop', '/event', '/path'):
+                                     '/record/stop'):
                     self.send_error(404);return
                 try:
                     length = int(self.headers.get('Content-Length', '0'))
@@ -172,15 +164,6 @@ class LocalPreview:
                         command = ('record_start', duration)
                     elif self.path == '/record/stop':
                         command = ('record_stop', None)
-                    elif self.path == '/event':
-                        label = body.get('label')
-                        if label not in ('motor_started', 'motor_stopped'):raise ValueError('event')
-                        command = ('event', label)
-                    elif self.path == '/path':
-                        kind, size = body.get('kind'), float(body.get('size_mm', 20))
-                        if kind not in ('line', 'line_negative_y', 'square', 'clear'):raise ValueError('path')
-                        if not math.isfinite(size) or not 5 <= size <= 40:raise ValueError('path size')
-                        command = ('path', (kind, size))
                     else:
                         command = (self.path[1:], None)
                     owner.commands.put_nowait(command)
